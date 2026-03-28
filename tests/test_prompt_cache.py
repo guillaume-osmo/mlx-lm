@@ -903,6 +903,31 @@ class TestPromptCache(unittest.TestCase):
             else:
                 os.environ["MLX_TQ_FUSED"] = prev
 
+    def test_turboquant_prod_fused_scores_match_reference(self):
+        """Test prod-mode fused scores match dequantized key scores."""
+        if not hasattr(mx.fast, "turboquant_qk_prod_scores_batched"):
+            self.skipTest("Native TurboQuant prod QK op unavailable")
+
+        prev = os.environ.get("MLX_TQ_FUSED")
+        os.environ["MLX_TQ_FUSED"] = "1"
+        try:
+            cache = TurboQuantKVCache(bits=3, estimator_mode="prod")
+            k = mx.random.normal(shape=(1, 1, 11, 64))
+            v = mx.random.normal(shape=(1, 1, 11, 64))
+            dk, _ = cache.update_and_fetch(k, v)
+
+            q = mx.random.normal(shape=(1, 1, 2, 64))
+            scores_ref = q @ mx.swapaxes(dk, -1, -2)
+            scores_fused = cache.fused_scores(q)
+            mx.eval(scores_ref, scores_fused)
+
+            self.assertTrue(mx.allclose(scores_fused, scores_ref, rtol=4e-3, atol=4e-3))
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
     def test_turboquant_with_model(self):
         """Test TurboQuantKVCache with actual model generation."""
         num_layers = len(self.model.layers)

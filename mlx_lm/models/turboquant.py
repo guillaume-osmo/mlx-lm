@@ -467,17 +467,19 @@ class TurboQuantKVCache(_BaseCache):
         self._v_norms[..., prev : prev + num_steps, :] = v_norms
         self.offset += num_steps
 
-        can_use_fused_decode = (
-            self._fused_enabled
-            and self.estimator_mode == "mse"
-            and B == 1
-            and num_steps == 1
-        )
+        can_use_fused_decode = self._fused_enabled and B == 1 and num_steps == 1
         can_use_fused_av = can_use_fused_decode and hasattr(
             mx.fast, "turboquant_av_packed_values_batched"
-        )
-        can_use_fused_qk = can_use_fused_decode and hasattr(
-            mx.fast, "turboquant_qk_packed_scores"
+        ) and self.estimator_mode == "mse"
+        can_use_fused_qk = can_use_fused_decode and (
+            (
+                self.estimator_mode == "mse"
+                and hasattr(mx.fast, "turboquant_qk_packed_scores")
+            )
+            or (
+                self.estimator_mode == "prod"
+                and hasattr(mx.fast, "turboquant_qk_prod_scores_batched")
+            )
         )
 
         all_v = None
@@ -497,8 +499,6 @@ class TurboQuantKVCache(_BaseCache):
         """
         if (
             not self._fused_enabled
-            or self.estimator_mode != "mse"
-            or not hasattr(mx.fast, "turboquant_qk_packed_scores")
             or self._k_indices is None
             or self.offset <= 0
             or queries_scaled.ndim != 4
@@ -516,6 +516,25 @@ class TurboQuantKVCache(_BaseCache):
         q_rot = _apply_rotation(
             queries_scaled, self._rotation_t, mode=self.rotation_mode
         )
+
+        if self.estimator_mode == "prod":
+            if not hasattr(mx.fast, "turboquant_qk_prod_scores_batched"):
+                return None
+            return mx.fast.turboquant_qk_prod_scores_batched(
+                mx.contiguous(q_rot.astype(mx.float32)),
+                mx.contiguous(queries_scaled.astype(mx.float32)),
+                mx.contiguous(self._k_indices[..., : self.offset, :]),
+                mx.contiguous(self._k_norms[..., : self.offset, 0].astype(mx.float32)),
+                self._k_centroids,
+                self._k_bits,
+                mx.contiguous(self._k_qjl_indices[..., : self.offset, :]),
+                mx.contiguous(self._k_qjl_gamma[..., : self.offset, 0].astype(mx.float32)),
+                self._qjl_projection,
+                n_repeats,
+            )
+
+        if not hasattr(mx.fast, "turboquant_qk_packed_scores"):
+            return None
 
         if hasattr(mx.fast, "turboquant_qk_packed_scores_batched"):
             # Materialize stable contiguous inputs for the native batched op.
