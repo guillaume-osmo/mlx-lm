@@ -928,6 +928,35 @@ class TestPromptCache(unittest.TestCase):
             else:
                 os.environ["MLX_TQ_FUSED"] = prev
 
+    def test_turboquant_prod_fused_attention_matches_reference(self):
+        """Test prod-mode fused decode attention matches dequantized SDPA."""
+        if not hasattr(mx.fast, "turboquant_decode_attention_prod_batched"):
+            self.skipTest("Native TurboQuant prod decode attention op unavailable")
+
+        prev = os.environ.get("MLX_TQ_FUSED")
+        os.environ["MLX_TQ_FUSED"] = "0"
+        try:
+            cache = TurboQuantKVCache(bits=3, estimator_mode="prod")
+            k = mx.random.normal(shape=(1, 1, 9, 64))
+            v = mx.random.normal(shape=(1, 1, 9, 64))
+            dk, dv = cache.update_and_fetch(k, v)
+
+            q = mx.random.normal(shape=(1, 1, 1, 64))
+            scores = q @ mx.swapaxes(dk, -1, -2)
+            probs = mx.softmax(scores, axis=-1, precise=True)
+            out_ref = probs @ dv
+
+            cache._fused_enabled = True
+            out_fused = cache.fused_attention(q)
+            mx.eval(out_ref, out_fused)
+
+            self.assertTrue(mx.allclose(out_fused, out_ref, rtol=4e-3, atol=4e-3))
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
     def test_turboquant_with_model(self):
         """Test TurboQuantKVCache with actual model generation."""
         num_layers = len(self.model.layers)

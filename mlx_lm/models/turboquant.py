@@ -468,9 +468,19 @@ class TurboQuantKVCache(_BaseCache):
         self.offset += num_steps
 
         can_use_fused_decode = self._fused_enabled and B == 1 and num_steps == 1
+        can_use_native_decode = can_use_fused_decode and (
+            (
+                self.estimator_mode == "mse"
+                and hasattr(mx.fast, "turboquant_decode_attention_packed_batched")
+            )
+            or (
+                self.estimator_mode == "prod"
+                and hasattr(mx.fast, "turboquant_decode_attention_prod_batched")
+            )
+        )
         can_use_fused_av = can_use_fused_decode and hasattr(
             mx.fast, "turboquant_av_packed_values_batched"
-        ) and self.estimator_mode == "mse"
+        )
         can_use_fused_qk = can_use_fused_decode and (
             (
                 self.estimator_mode == "mse"
@@ -483,9 +493,11 @@ class TurboQuantKVCache(_BaseCache):
         )
 
         all_v = None
-        if not (can_use_fused_qk and can_use_fused_av):
+        if not (can_use_native_decode or (can_use_fused_qk and can_use_fused_av)):
             all_v = self._dequantize_values(dtype=values.dtype)
-        all_k = None if can_use_fused_qk else self._dequantize_keys(dtype=keys.dtype)
+        all_k = None if (can_use_native_decode or can_use_fused_qk) else self._dequantize_keys(
+            dtype=keys.dtype
+        )
         return all_k, all_v
 
     def fused_scores(self, queries_scaled):
@@ -571,8 +583,6 @@ class TurboQuantKVCache(_BaseCache):
         """Compute packed decode attention in one native op when supported."""
         if (
             not self._fused_enabled
-            or self.estimator_mode != "mse"
-            or not hasattr(mx.fast, "turboquant_decode_attention_packed_batched")
             or self._k_indices is None
             or self._v_indices is None
             or self.offset <= 0
@@ -593,17 +603,40 @@ class TurboQuantKVCache(_BaseCache):
         q_rot = _apply_rotation(
             queries_scaled, self._rotation_t, mode=self.rotation_mode
         )
-        out = mx.fast.turboquant_decode_attention_packed_batched(
-            mx.contiguous(q_rot.astype(mx.float32)),
-            mx.contiguous(self._k_indices[..., : self.offset, :]),
-            mx.contiguous(self._k_norms[..., : self.offset, 0].astype(mx.float32)),
-            mx.contiguous(self._v_indices[..., : self.offset, :]),
-            mx.contiguous(self._v_norms[..., : self.offset, 0].astype(mx.float32)),
-            self._k_centroids,
-            self._k_bits,
-            n_repeats,
-            self._head_dim,
-        )
+        if self.estimator_mode == "prod":
+            if not hasattr(mx.fast, "turboquant_decode_attention_prod_batched"):
+                return None
+            out = mx.fast.turboquant_decode_attention_prod_batched(
+                mx.contiguous(q_rot.astype(mx.float32)),
+                mx.contiguous(queries_scaled.astype(mx.float32)),
+                mx.contiguous(self._k_indices[..., : self.offset, :]),
+                mx.contiguous(self._k_norms[..., : self.offset, 0].astype(mx.float32)),
+                self._k_centroids,
+                self._k_bits,
+                mx.contiguous(self._k_qjl_indices[..., : self.offset, :]),
+                mx.contiguous(self._k_qjl_gamma[..., : self.offset, 0].astype(mx.float32)),
+                self._qjl_projection,
+                mx.contiguous(self._v_indices[..., : self.offset, :]),
+                mx.contiguous(self._v_norms[..., : self.offset, 0].astype(mx.float32)),
+                self._v_centroids,
+                self._v_bits,
+                n_repeats,
+                self._head_dim,
+            )
+        else:
+            if not hasattr(mx.fast, "turboquant_decode_attention_packed_batched"):
+                return None
+            out = mx.fast.turboquant_decode_attention_packed_batched(
+                mx.contiguous(q_rot.astype(mx.float32)),
+                mx.contiguous(self._k_indices[..., : self.offset, :]),
+                mx.contiguous(self._k_norms[..., : self.offset, 0].astype(mx.float32)),
+                mx.contiguous(self._v_indices[..., : self.offset, :]),
+                mx.contiguous(self._v_norms[..., : self.offset, 0].astype(mx.float32)),
+                self._k_centroids,
+                self._k_bits,
+                n_repeats,
+                self._head_dim,
+            )
         out = _apply_inverse_rotation(out, self._rotation, mode=self.rotation_mode)
         if self._value_dtype is not None:
             out = out.astype(self._value_dtype)
@@ -620,7 +653,6 @@ class TurboQuantKVCache(_BaseCache):
         """
         if (
             not self._fused_enabled
-            or self.estimator_mode != "mse"
             or not hasattr(mx.fast, "turboquant_av_packed_values_batched")
             or self._v_indices is None
             or self.offset <= 0
