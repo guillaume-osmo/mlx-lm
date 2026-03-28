@@ -49,6 +49,32 @@ def setup_arg_parser():
         help="Number of timing trials",
         type=int,
     )
+    parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        default=None,
+        help="[Experimental] Enable TurboQuant KV cache compression (2-4 bits).",
+    )
+    parser.add_argument(
+        "--turbo-rotation-mode",
+        type=str,
+        choices=["dense", "rotor3", "rotorquant"],
+        default="dense",
+        help="[Experimental] TurboQuant rotation mode.",
+    )
+    parser.add_argument(
+        "--turbo-estimator-mode",
+        type=str,
+        choices=["mse", "prod"],
+        default="mse",
+        help="[Experimental] TurboQuant estimator mode.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-tau",
+        type=float,
+        default=None,
+        help="[Experimental] Optional sparse-V threshold in TurboQuant fused decode.",
+    )
     return parser
 
 
@@ -85,15 +111,31 @@ def main():
 
     def single_bench():
         for response in stream_generate(
-            model, tokenizer, prompt, max_tokens=generation_tokens
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=generation_tokens,
+            turbo_kv_bits=args.turbo_kv_bits,
+            turbo_rotation_mode=args.turbo_rotation_mode,
+            turbo_estimator_mode=args.turbo_estimator_mode,
+            turbo_sparse_v_tau=args.turbo_sparse_v_tau,
         ):
             pass
         return response
 
     def batch_bench():
         return batch_generate(
-            model, tokenizer, prompts, max_tokens=generation_tokens
+            model,
+            tokenizer,
+            prompts,
+            max_tokens=generation_tokens,
         ).stats
+
+    if batch_size > 1 and args.turbo_kv_bits is not None:
+        rprint(
+            "[WARNING] TurboQuant benchmark flags currently apply only for --batch-size 1; "
+            "running regular batch path for this run."
+        )
 
     if batch_size == 1:
         _bench = single_bench

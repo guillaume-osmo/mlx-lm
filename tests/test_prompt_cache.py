@@ -10,12 +10,12 @@ import mlx.core as mx
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
-    MambaCache,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -23,6 +23,7 @@ from mlx_lm.models.cache import (
     save_prompt_cache,
     trim_prompt_cache,
 )
+from mlx_lm.models.turboquant import TurboQuantKVCache, _cached_qjl_projection
 from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
@@ -34,6 +35,7 @@ class TestPromptCache(unittest.TestCase):
     def setUpClass(cls):
         cls.test_dir_fid = tempfile.TemporaryDirectory()
         cls.test_dir = cls.test_dir_fid.name
+        cls.model, cls.tokenizer = load(HF_MODEL_PATH)
 
     @classmethod
     def tearDownClass(cls):
@@ -101,14 +103,14 @@ class TestPromptCache(unittest.TestCase):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
         cache = [
-            MambaCache(),
+            ArraysCache(size=2),
             KVCache(),
             RotatingKVCache(8),
-            MambaCache(),
+            ArraysCache(size=2),
             ChunkedKVCache(256),
         ]
         for c in cache:
-            if isinstance(c, MambaCache):
+            if isinstance(c, ArraysCache):
                 c[0] = mx.random.uniform(shape=(4, 4, 4))
                 c[1] = mx.random.uniform(shape=(4, 4, 4))
             else:
@@ -119,7 +121,7 @@ class TestPromptCache(unittest.TestCase):
         save_prompt_cache(cache_file, cache)
         loaded_cache = load_prompt_cache(cache_file)
         for c, lc in zip(cache, loaded_cache):
-            if isinstance(c, MambaCache):
+            if isinstance(c, ArraysCache):
                 self.assertTrue(mx.array_equal(c[0], lc[0]))
                 self.assertTrue(mx.array_equal(c[1], lc[1]))
             else:
@@ -131,8 +133,56 @@ class TestPromptCache(unittest.TestCase):
                 self.assertTrue(mx.array_equal(k, lk))
                 self.assertTrue(mx.array_equal(v, lv))
 
+    def test_save_load_cache_list(self):
+        cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
+
+        cache = [
+            ArraysCache(size=2),
+            KVCache(),
+            RotatingKVCache(8),
+            ArraysCache(size=2),
+            ChunkedKVCache(256),
+        ]
+        for c in cache:
+            if isinstance(c, ArraysCache):
+                c[0] = mx.random.uniform(shape=(4, 4, 4))
+                c[1] = mx.random.uniform(shape=(4, 4, 4))
+            else:
+                x = mx.random.uniform(shape=(4, 4, 7, 4))
+                y = mx.random.uniform(shape=(4, 4, 7, 4))
+                c.update_and_fetch(x, y)
+        cache = [CacheList(*cache)]
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        for c, lc in zip(cache[0].caches, loaded_cache[0].caches):
+            if isinstance(c, ArraysCache):
+                self.assertTrue(mx.array_equal(c[0], lc[0]))
+                self.assertTrue(mx.array_equal(c[1], lc[1]))
+            else:
+                x = mx.random.uniform(shape=(4, 4, 1, 4))
+                y = mx.random.uniform(shape=(4, 4, 1, 4))
+                k, v = c.update_and_fetch(x, y)
+                lk, lv = lc.update_and_fetch(x, y)
+                self.assertEqual(c.offset, lc.offset)
+                self.assertTrue(mx.array_equal(k, lk))
+                self.assertTrue(mx.array_equal(v, lv))
+
+    def test_save_load_arrays_cache(self):
+        cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
+
+        cache = [ArraysCache(size=2)]
+        cache[0][0] = mx.zeros((1, 4, 4))
+        cache[0][1] = mx.zeros((1, 4, 4))
+
+        save_prompt_cache(cache_file, cache)
+        loaded = load_prompt_cache(cache_file)
+
+        # Try to make a mask
+        mask = loaded[0].make_mask(4)
+
     def test_cache_with_generate(self):
-        model, tokenizer = load(HF_MODEL_PATH)
+        model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
         results = list(generate_step(prompt, model, max_tokens=4))
         toks, all_logits = zip(*results)
@@ -167,16 +217,18 @@ class TestPromptCache(unittest.TestCase):
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
 
-        # Can't trim mamba cache
-        cache = [MambaCache() for _ in range(2)]
+        # Can't trim arrays cache
+        cache = [ArraysCache(size=2) for _ in range(2)]
         for c in cache:
-            c.state = mx.zeros((5, 5))
+            c[0] = mx.zeros((5, 5))
+            c[1] = mx.zeros((5, 5))
         num_trimmed = trim_prompt_cache(cache, 7)
         self.assertEqual(num_trimmed, 0)
 
         # All cache's have to be trimmable
-        cache = [MambaCache(), KVCache()]
-        cache[0].state = mx.zeros((5, 5))
+        cache = [ArraysCache(size=2), KVCache()]
+        cache[0][0] = mx.zeros((5, 5))
+        cache[0][1] = mx.zeros((5, 5))
         x = mx.random.uniform(shape=(1, 8, 10, 4))
         cache[1].update_and_fetch(x, x)
         num_trimmed = trim_prompt_cache(cache, 1)
@@ -212,7 +264,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(num_trimmed, 3)
 
     def test_trim_cache_with_generate(self):
-        model, tokenizer = load(HF_MODEL_PATH)
+        model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
 
         prompt_cache = make_prompt_cache(model)
@@ -289,7 +341,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(metadata, loaded_metadata)
 
     def test_cache_to_quantized(self):
-        model, tokenizer = load(HF_MODEL_PATH)
+        model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
         results = zip(range(4), generate_step(prompt, model))
         toks, all_logits = zip(*(r[1] for r in results))
@@ -323,8 +375,28 @@ class TestPromptCache(unittest.TestCase):
         m = c.trim(5)
         self.assertEqual(m, 5)
 
-        c = CacheList(MambaCache(), KVCache())
+        c = CacheList(ArraysCache(size=2), KVCache())
         self.assertFalse(c.is_trimmable())
+
+        c1 = CacheList(ArraysCache(size=1), KVCache())
+        c1[0][0] = mx.random.normal(shape=(1, 2, 4, 4))
+        c1[1].update_and_fetch(
+            mx.random.normal(shape=(1, 2, 5, 4)), mx.random.normal(shape=(1, 2, 5, 4))
+        )
+
+        c2 = CacheList(ArraysCache(size=1), KVCache())
+        c2[0][0] = mx.random.normal(shape=(1, 2, 4, 4))
+        c2[1].update_and_fetch(
+            mx.random.normal(shape=(1, 2, 7, 4)), mx.random.normal(shape=(1, 2, 7, 4))
+        )
+
+        merged_cache = CacheList.merge((c1, c2))
+        c1_ex = merged_cache.extract(0)
+        self.assertTrue(mx.array_equal(c1_ex[0][0], c1[0][0]))
+        self.assertTrue(mx.array_equal(c1_ex[1].state[0], c1[1].state[0]))
+        c2_ex = merged_cache.extract(1)
+        self.assertTrue(mx.array_equal(c2_ex[0][0], c2[0][0]))
+        self.assertTrue(mx.array_equal(c2_ex[1].state[0], c2[1].state[0]))
 
     def test_make_mask_with_cache(self):
         # For 1 time step with no cache, don't need a mask
@@ -535,12 +607,12 @@ class TestPromptCache(unittest.TestCase):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
         cache = [
-            MambaCache(left_padding=[1, 2]),
+            ArraysCache(size=2, left_padding=[1, 2]),
             BatchKVCache(left_padding=[1, 2]),
             BatchRotatingKVCache(max_size=10, left_padding=[1, 2]),
         ]
         for c in cache:
-            if isinstance(c, MambaCache):
+            if isinstance(c, ArraysCache):
                 c[0] = mx.random.uniform(shape=(4, 4, 4))
                 c[1] = mx.random.uniform(shape=(4, 4, 4))
             else:
@@ -567,6 +639,312 @@ class TestPromptCache(unittest.TestCase):
         k, v = cache.update_and_fetch(k, v)
         self.assertEqual(k.shape[2], 10)
         self.assertEqual(v.shape[2], 10)
+
+    def test_merge_with_empty_caches(self):
+        c1 = ArraysCache(2)
+        c2 = ArraysCache(2)
+        c2[0] = mx.zeros((1, 4))
+        c2[1] = mx.zeros((1, 4))
+        c_out = ArraysCache.merge((c1, c2))
+        self.assertEqual(c_out[0].shape, (2, 4))
+        self.assertEqual(c_out[1].shape, (2, 4))
+
+        c1 = KVCache()
+        c2 = KVCache()
+        kv = mx.zeros((1, 4, 4, 4))
+        c2.update_and_fetch(kv, kv)
+        c_out = KVCache.merge((c1, c2))
+        self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
+
+        c1 = RotatingKVCache(max_size=4)
+        c2 = RotatingKVCache(max_size=4)
+        kv = mx.zeros((1, 4, 4, 4))
+        c2.update_and_fetch(kv, kv)
+        c_out = KVCache.merge((c1, c2))
+        self.assertEqual(c_out.keys.shape, (2, 4, 4, 4))
+
+    def test_window_mask_with_full_kv_cache(self):
+        c = KVCache()
+        kv = mx.zeros((1, 1, 32, 128))
+        c.update_and_fetch(kv, kv)
+
+        h = mx.zeros((1, 1, 1, 128))
+        mask = create_attention_mask(h, c, window_size=4)
+        expected = create_causal_mask(1, offset=32, window_size=4)
+        self.assertTrue(mx.array_equal(mask, expected))
+
+    def test_turboquant_cache_basic(self):
+        """Test TurboQuantKVCache update_and_fetch, offset, shapes."""
+        for bits in [2, 3, 4]:
+            c = TurboQuantKVCache(bits=bits)
+            self.assertTrue(c.empty())
+            self.assertEqual(c.size(), 0)
+
+            # Prefill
+            k = mx.random.uniform(shape=(1, 8, 10, 64))
+            v = mx.random.uniform(shape=(1, 8, 10, 64))
+            dk, dv = c.update_and_fetch(k, v)
+            mx.eval(dk, dv)
+
+            self.assertEqual(c.size(), 10)
+            self.assertFalse(c.empty())
+            self.assertEqual(dk.shape, (1, 8, 10, 64))
+            self.assertEqual(dv.shape, (1, 8, 10, 64))
+
+            # Decode step
+            k2 = mx.random.uniform(shape=(1, 8, 1, 64))
+            v2 = mx.random.uniform(shape=(1, 8, 1, 64))
+            dk2, dv2 = c.update_and_fetch(k2, v2)
+            mx.eval(dk2, dv2)
+
+            self.assertEqual(c.size(), 11)
+            self.assertEqual(dk2.shape, (1, 8, 11, 64))
+
+    def test_turboquant_cache_quality(self):
+        """Test that TurboQuant dequantized output is close to input."""
+        c = TurboQuantKVCache(bits=4)
+        k = mx.random.normal(shape=(1, 8, 32, 128))
+        v = mx.random.normal(shape=(1, 8, 32, 128))
+        dk, dv = c.update_and_fetch(k, v)
+        mx.eval(dk, dv, k, v)
+
+        # Cosine similarity per vector should be high at 4-bit
+        cos_k = mx.mean(
+            mx.sum(k * dk, axis=-1)
+            / (mx.linalg.norm(k, axis=-1) * mx.linalg.norm(dk, axis=-1) + 1e-8)
+        )
+        mx.eval(cos_k)
+        self.assertGreater(float(cos_k), 0.95)
+
+    def test_turboquant_cache_trim(self):
+        """Test TurboQuantKVCache trim."""
+        c = TurboQuantKVCache(bits=3)
+        k = mx.random.uniform(shape=(1, 4, 8, 64))
+        c.update_and_fetch(k, k)
+        self.assertEqual(c.size(), 8)
+        self.assertTrue(c.is_trimmable())
+
+        trimmed = c.trim(3)
+        self.assertEqual(trimmed, 3)
+        self.assertEqual(c.size(), 5)
+
+    def test_turboquant_save_load(self):
+        """Test TurboQuantKVCache save/load roundtrip."""
+        cache_file = os.path.join(self.test_dir, "turbo_cache.safetensors")
+
+        cache = [TurboQuantKVCache(bits=3) for _ in range(4)]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, 8, 10, 64))
+            c.update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self.assertEqual(len(cache), len(loaded_cache))
+
+        for c, lc in zip(cache, loaded_cache):
+            self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c.turbo_bits, lc.turbo_bits)
+            self.assertEqual(getattr(lc, "rotation_mode", "dense"), "dense")
+
+    def test_turboquant_to_turboquant(self):
+        """Test KVCache.to_turboquant conversion."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turboquant(bits=4)
+        self.assertEqual(tq_cache.size(), 16)
+        self.assertFalse(tq_cache.empty())
+
+    def test_turboquant_prod_mode_uses_qjl_residual(self):
+        """Test prod mode stores a separate 1-bit QJL residual for keys."""
+        c = TurboQuantKVCache(bits=3, estimator_mode="prod")
+        k = mx.random.normal(shape=(1, 4, 12, 64))
+        v = mx.random.normal(shape=(1, 4, 12, 64))
+        dk, dv = c.update_and_fetch(k, v)
+        mx.eval(dk, dv)
+
+        self.assertEqual(c.estimator_mode, "prod")
+        self.assertIsNotNone(c._k_qjl_indices)
+        self.assertIsNotNone(c._k_qjl_gamma)
+        self.assertLess(c._k_indices.shape[-1], c._v_indices.shape[-1])
+        self.assertEqual(dk.shape, k.shape)
+        self.assertEqual(dv.shape, v.shape)
+
+    def test_turboquant_prod_correction_is_unbiased_in_expectation(self):
+        """Test prod-mode QJL correction improves score reconstruction in expectation."""
+        mx.random.seed(0)
+        k = mx.random.normal(shape=(1, 1, 96, 128))
+        v = mx.random.normal(shape=(1, 1, 96, 128))
+        q = mx.random.normal(shape=(1, 1, 48, 128))
+
+        c = TurboQuantKVCache(bits=3, estimator_mode="prod")
+        c.update_and_fetch(k, v)
+        dk_mse = c._dequantize_keys(include_qjl=False, dtype=k.dtype)
+
+        prod_samples = []
+        for seed in range(16):
+            sample = TurboQuantKVCache(bits=3, estimator_mode="prod")
+            sample._init_codebook(128)
+            sample._qjl_projection, sample._qjl_projection_t = _cached_qjl_projection(
+                128, seed=seed
+            )
+            dk_prod, _ = sample.update_and_fetch(k, v)
+            prod_samples.append(dk_prod)
+        dk_prod = mx.mean(mx.stack(prod_samples, axis=0), axis=0)
+
+        scores_true = q @ mx.swapaxes(k, -1, -2)
+        scores_mse = q @ mx.swapaxes(dk_mse, -1, -2)
+        scores_prod = q @ mx.swapaxes(dk_prod, -1, -2)
+        err_mse = mx.mean(mx.square(scores_true - scores_mse))
+        err_prod = mx.mean(mx.square(scores_true - scores_prod))
+        mx.eval(err_mse, err_prod)
+
+        self.assertLess(float(err_prod), float(err_mse))
+
+    def test_turboquant_rotor3_mode(self):
+        """Test TurboQuant rotor3 mode wiring and cache state."""
+        c = TurboQuantKVCache(bits=4, rotation_mode="rotor3", sparse_v_tau=1e-4)
+        k = mx.random.normal(shape=(1, 8, 12, 96))
+        v = mx.random.normal(shape=(1, 8, 12, 96))
+        dk, dv = c.update_and_fetch(k, v)
+        mx.eval(dk, dv)
+
+        self.assertEqual(c.size(), 12)
+        self.assertEqual(c.rotation_mode, "rotor3")
+        self.assertAlmostEqual(c.sparse_v_tau, 1e-4, places=8)
+
+    def test_turboquant_rotorquant_nondivisible_dim_stays_independent(self):
+        """Test RotorQuant stays blockwise even when head dim is not divisible by 3."""
+        c = TurboQuantKVCache(bits=4, rotation_mode="rotorquant")
+        k = mx.random.normal(shape=(1, 4, 6, 64))
+        v = mx.random.normal(shape=(1, 4, 6, 64))
+        dk, dv = c.update_and_fetch(k, v)
+        mx.eval(dk, dv)
+
+        self.assertEqual(c.rotation_mode, "rotorquant")
+        self.assertEqual(c._rotation.ndim, 3)
+        self.assertEqual(c._rotation.shape[0], 64 // 3)
+
+    def test_turboquant_prod_save_load(self):
+        """Test prod-mode TurboQuant cache save/load roundtrip."""
+        cache_file = os.path.join(self.test_dir, "turbo_cache_prod.safetensors")
+
+        cache = [TurboQuantKVCache(bits=3, estimator_mode="prod") for _ in range(2)]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, 8, 10, 64))
+            c.update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+
+        for c, lc in zip(cache, loaded_cache):
+            self.assertEqual(c.offset, lc.offset)
+            self.assertEqual(c.turbo_bits, lc.turbo_bits)
+            self.assertEqual(lc.estimator_mode, "prod")
+            self.assertIsNotNone(lc._k_qjl_indices)
+            self.assertIsNotNone(lc._k_qjl_gamma)
+
+    def test_turboquant_fused_av_matches_dequantized_values(self):
+        """Test fused AV restores values back to the model basis."""
+        if not hasattr(mx.fast, "turboquant_av_packed_values_batched"):
+            self.skipTest("Native TurboQuant AV op unavailable")
+
+        prev = os.environ.get("MLX_TQ_FUSED")
+        os.environ["MLX_TQ_FUSED"] = "0"
+        try:
+            cache = TurboQuantKVCache(bits=4, rotation_mode="rotorquant")
+            k = mx.random.normal(shape=(1, 1, 5, 96))
+            v = mx.random.normal(shape=(1, 1, 5, 96))
+            _, dv = cache.update_and_fetch(k, v)
+            mx.eval(dv)
+
+            probs = mx.array([[[[0.05, 0.15, 0.3, 0.25, 0.25]]]], dtype=mx.float32)
+            out_ref = probs @ dv
+
+            cache._fused_enabled = True
+            out_fused = cache.fused_av(probs)
+            mx.eval(out_ref, out_fused)
+
+            self.assertTrue(mx.allclose(out_fused, out_ref, rtol=2e-3, atol=2e-3))
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
+    def test_turboquant_fused_attention_matches_reference(self):
+        """Test fused packed decode attention matches dequantized SDPA."""
+        if not hasattr(mx.fast, "turboquant_decode_attention_packed_batched"):
+            self.skipTest("Native TurboQuant decode attention op unavailable")
+
+        prev = os.environ.get("MLX_TQ_FUSED")
+        os.environ["MLX_TQ_FUSED"] = "0"
+        try:
+            cache = TurboQuantKVCache(bits=4, rotation_mode="rotorquant")
+            k = mx.random.normal(shape=(1, 1, 7, 64))
+            v = mx.random.normal(shape=(1, 1, 7, 64))
+            dk, dv = cache.update_and_fetch(k, v)
+
+            q = mx.random.normal(shape=(1, 1, 1, 64))
+            scores = q @ mx.swapaxes(dk, -1, -2)
+            probs = mx.softmax(scores, axis=-1, precise=True)
+            out_ref = probs @ dv
+
+            cache._fused_enabled = True
+            out_fused = cache.fused_attention(q)
+            mx.eval(out_ref, out_fused)
+
+            self.assertTrue(mx.allclose(out_fused, out_ref, rtol=3e-3, atol=3e-3))
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
+    def test_turboquant_with_model(self):
+        """Test TurboQuantKVCache with actual model generation."""
+        num_layers = len(self.model.layers)
+        args = self.model.args
+        head_dim = getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        )
+
+        # FP16 baseline
+        fp16_cache = [KVCache() for _ in range(num_layers)]
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+        logits_fp16 = self.model(prompt, cache=fp16_cache)
+        mx.eval(logits_fp16)
+
+        # TurboQuant
+        tq_cache = [TurboQuantKVCache(bits=4) for _ in range(num_layers)]
+        logits_tq = self.model(prompt, cache=tq_cache)
+        mx.eval(logits_tq)
+
+        self.assertEqual(logits_fp16.shape, logits_tq.shape)
+
+        # Logit cosine similarity should be reasonable
+        l1 = logits_fp16[0, -1].astype(mx.float32)
+        l2 = logits_tq[0, -1].astype(mx.float32)
+        cos = float(
+            mx.sum(l1 * l2) / (mx.linalg.norm(l1) * mx.linalg.norm(l2) + 1e-8)
+        )
+        self.assertGreater(cos, 0.9)
+
+    def test_turboquant_nbytes(self):
+        """Test TurboQuantKVCache memory is less than FP16."""
+        kv = KVCache()
+        tq = TurboQuantKVCache(bits=3)
+
+        k = mx.random.uniform(shape=(1, 8, 256, 128))
+        v = mx.random.uniform(shape=(1, 8, 256, 128))
+
+        kv.update_and_fetch(k, v)
+        tq.update_and_fetch(k, v)
+        mx.eval(kv.keys, tq._k_indices)
+
+        self.assertLess(tq.nbytes, kv.nbytes)
 
 
 if __name__ == "__main__":

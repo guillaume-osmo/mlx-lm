@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -105,6 +106,20 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+
+
+def _resolve_turbo_sparse_v_tau(cache) -> Optional[float]:
+    tau = getattr(cache, "sparse_v_tau", None)
+    if tau is not None:
+        return float(tau)
+    tau_env = os.environ.get("MLX_TQ_SPARSE_V_TAU")
+    if tau_env is None:
+        return None
+    try:
+        return float(tau_env)
+    except ValueError:
+        return None
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -114,6 +129,73 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    sparse_v_tau = _resolve_turbo_sparse_v_tau(cache)
+
+    # TurboQuant packed decode attention: QK + softmax + AV in one native op.
+    if hasattr(cache, "fused_attention") and keys is None and values is None:
+        if sinks is not None:
+            raise ValueError("TurboQuant fused SDPA does not support attention sinks.")
+        if mask is None and (sparse_v_tau is None or sparse_v_tau <= 0):
+            out = cache.fused_attention(queries * scale)
+            if out is not None:
+                return out
+
+    # TurboQuant fused path: score directly from packed keys to avoid full key dequantization.
+    if hasattr(cache, "fused_scores") and keys is None:
+        if sinks is not None:
+            raise ValueError("TurboQuant fused SDPA does not support attention sinks.")
+        queries_scaled = queries * scale
+        scores = cache.fused_scores(queries_scaled)
+        if scores is not None:
+            if mask is not None:
+                if isinstance(mask, str):
+                    qL, kL = scores.shape[-2:]
+                    q_indices = mx.arange(kL - qL, kL)
+                    k_indices = mx.arange(kL)
+                    mask = q_indices[:, None] >= k_indices[None]
+                if mask.dtype == mx.bool_:
+                    scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+                else:
+                    scores += mask
+            probs = mx.softmax(scores, axis=-1, precise=True)
+            if sparse_v_tau is not None and sparse_v_tau > 0:
+                probs = mx.where(probs >= sparse_v_tau, probs, 0.0)
+                probs = probs / mx.maximum(mx.sum(probs, axis=-1, keepdims=True), 1e-8)
+
+            if values is None and hasattr(cache, "fused_av"):
+                out = cache.fused_av(probs)
+                if out is not None:
+                    return out
+
+            if values is None:
+                raise ValueError("TurboQuant fused AV path unavailable for this decode step.")
+
+            n_q_heads = probs.shape[1]
+            n_kv_heads = values.shape[1]
+            if n_q_heads % n_kv_heads == 0 and n_q_heads != n_kv_heads:
+                n_repeats = n_q_heads // n_kv_heads
+                probs = mx.reshape(
+                    probs,
+                    (
+                        probs.shape[0],
+                        n_kv_heads,
+                        n_repeats,
+                        probs.shape[2],
+                        probs.shape[3],
+                    ),
+                )
+                out = probs @ mx.expand_dims(values, axis=2)
+                return mx.reshape(
+                    out,
+                    (
+                        out.shape[0],
+                        n_q_heads,
+                        out.shape[3],
+                        out.shape[4],
+                    ),
+                )
+            return probs @ values
+
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
@@ -126,12 +208,12 @@ def scaled_dot_product_attention(
             group_size=cache.group_size,
             bits=cache.bits,
         )
-    else:
-        return mx.fast.scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale=scale,
-            mask=mask,
-            sinks=sinks,
-        )
+
+    return mx.fast.scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        scale=scale,
+        mask=mask,
+        sinks=sinks,
+    )
