@@ -7,8 +7,12 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import generate_step
-from mlx_lm.models.base import create_attention_mask, create_causal_mask
+from mlx_lm.generate import generate_step, maybe_quantize_kv_cache
+from mlx_lm.models.base import (
+    create_attention_mask,
+    create_causal_mask,
+    scaled_dot_product_attention,
+)
 from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -23,10 +27,29 @@ from mlx_lm.models.cache import (
     save_prompt_cache,
     trim_prompt_cache,
 )
-from mlx_lm.models.turboquant import TurboQuantKVCache, _cached_qjl_projection
+from mlx_lm.models.rotorquant import RotorQuantKVCache
+from mlx_lm.models.turboquant import (
+    TurboQuantKVCache,
+    _cached_qjl_projection,
+    _metal_available,
+    _metal_qjl_score,
+    _pack,
+    _quantize_qjl_residual,
+    _quantize_qjl_residual_packed,
+    _unpack,
+)
 from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+
+
+class DummyCacheModel:
+    def __init__(self, caches):
+        self.layers = [object()] * len(caches)
+        self._caches = caches
+
+    def make_cache(self):
+        return copy.deepcopy(self._caches)
 
 
 class TestPromptCache(unittest.TestCase):
@@ -716,6 +739,43 @@ class TestPromptCache(unittest.TestCase):
         mx.eval(cos_k)
         self.assertGreater(float(cos_k), 0.95)
 
+    def test_turboquant_fractional_cache_basic(self):
+        """Test fractional-bit TurboQuant wiring and shapes."""
+        c = TurboQuantKVCache(bits=3.5)
+        self.assertTrue(c.empty())
+        self.assertEqual(c.size(), 0)
+
+        k = mx.random.uniform(shape=(1, 8, 10, 64))
+        v = mx.random.uniform(shape=(1, 8, 10, 64))
+        dk, dv = c.update_and_fetch(k, v)
+        mx.eval(dk, dv)
+
+        self.assertEqual(c.size(), 10)
+        self.assertFalse(c.empty())
+        self.assertEqual(dk.shape, (1, 8, 10, 64))
+        self.assertEqual(dv.shape, (1, 8, 10, 64))
+        self.assertTrue(c._fractional_split)
+        self.assertEqual(c._split_low_bits, 3)
+        self.assertEqual(c._split_high_bits, 4)
+        self.assertIsNotNone(c._split_low_cache)
+        self.assertIsNotNone(c._split_high_cache)
+
+    def test_turboquant_fractional_quality_improves_over_lower_integer(self):
+        """Test 3.5-bit reconstruction is better than 3-bit reconstruction."""
+        mx.random.seed(0)
+        k = mx.random.normal(shape=(1, 4, 32, 64))
+        v = mx.random.normal(shape=(1, 4, 32, 64))
+
+        c3 = TurboQuantKVCache(bits=3)
+        c35 = TurboQuantKVCache(bits=3.5)
+        dk3, dv3 = c3.update_and_fetch(k, v)
+        dk35, dv35 = c35.update_and_fetch(k, v)
+        err3 = mx.mean((k - dk3) ** 2) + mx.mean((v - dv3) ** 2)
+        err35 = mx.mean((k - dk35) ** 2) + mx.mean((v - dv35) ** 2)
+        mx.eval(err3, err35)
+
+        self.assertLess(float(err35), float(err3))
+
     def test_turboquant_cache_trim(self):
         """Test TurboQuantKVCache trim."""
         c = TurboQuantKVCache(bits=3)
@@ -757,6 +817,383 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(tq_cache.size(), 16)
         self.assertFalse(tq_cache.empty())
 
+    def test_turboquant_to_turboquant_prod_wht(self):
+        """Test KVCache.to_turboquant forwards the QJL projection mode."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turboquant(
+            bits=3,
+            estimator_mode="prod",
+            qjl_projection_mode="wht",
+        )
+        self.assertEqual(tq_cache.size(), 16)
+        self.assertEqual(tq_cache.estimator_mode, "prod")
+        self.assertEqual(tq_cache.qjl_projection_mode, "wht")
+        self.assertEqual(tq_cache._qjl_projection_runtime_mode, "wht")
+
+    def test_turboquant_to_turbo_quantized_alias(self):
+        """Test upstream-style alias forwards the richer local TurboQuant args."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turbo_quantized(
+            bits=3,
+            estimator_mode="prod",
+            qjl_projection_mode="wht",
+        )
+        self.assertEqual(tq_cache.size(), 16)
+        self.assertEqual(tq_cache.estimator_mode, "prod")
+        self.assertEqual(tq_cache.qjl_projection_mode, "wht")
+
+    def test_turboquant_to_turboquant_decode_buffer(self):
+        """Test KVCache.to_turboquant forwards the decode-buffer mode."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turboquant(bits=3, decode_buffer=True)
+        self.assertEqual(tq_cache.size(), 16)
+        self.assertTrue(tq_cache.decode_buffer)
+
+    def test_turboquant_to_turboquant_recent_buffer(self):
+        """Test KVCache.to_turboquant forwards recent-buffer settings."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turboquant(
+            bits=4,
+            buffer_size=16,
+            flush_batch_size=8,
+        )
+        self.assertEqual(tq_cache.buffer_size, 16)
+        self.assertEqual(tq_cache.flush_batch_size, 8)
+
+    def test_turboquant_to_turboquant_asymmetric_bits(self):
+        """Test KVCache.to_turboquant forwards separate K/V bit-widths."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turboquant(bits=4, key_bits=4, value_bits=3)
+        self.assertEqual(tq_cache.key_bits_override, 4)
+        self.assertEqual(tq_cache.value_bits_override, 3)
+        self.assertEqual(tq_cache._k_bits, 4)
+        self.assertEqual(tq_cache._v_bits, 3)
+
+    def test_turboquant_to_turboquant_max_kv_size(self):
+        """Test KVCache.to_turboquant forwards a max compressed KV window."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        tq_cache = kv_cache.to_turboquant(bits=4, max_cache_tokens=8)
+        self.assertEqual(tq_cache.max_cache_tokens, 8)
+        self.assertEqual(tq_cache.offset, 8)
+
+    def test_rotorquant_to_rotorquant(self):
+        """Test KVCache.to_rotorquant conversion."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        rq_cache = kv_cache.to_rotorquant(bits=4)
+        self.assertEqual(rq_cache.size(), 16)
+        self.assertFalse(rq_cache.empty())
+        self.assertIsInstance(rq_cache, RotorQuantKVCache)
+        self.assertEqual(rq_cache.rotation_mode, "rotorquant")
+
+    def test_rotorquant_to_rotorquant_decode_buffer(self):
+        """Test KVCache.to_rotorquant forwards the decode-buffer mode."""
+        kv_cache = KVCache()
+        k = mx.random.normal(shape=(1, 8, 16, 128))
+        v = mx.random.normal(shape=(1, 8, 16, 128))
+        kv_cache.update_and_fetch(k, v)
+
+        rq_cache = kv_cache.to_rotorquant(bits=4, decode_buffer=True)
+        self.assertEqual(rq_cache.size(), 16)
+        self.assertTrue(rq_cache.decode_buffer)
+        self.assertEqual(rq_cache.rotation_mode, "rotorquant")
+
+    def test_rotorquant_prod_mode_stores_qjl_residual(self):
+        """Test RotorQuant prod mode uses bits-1 on keys plus 1-bit QJL residual."""
+        cache = RotorQuantKVCache(bits=4, estimator_mode="prod")
+        k = mx.random.normal(shape=(1, 4, 12, 64))
+        v = mx.random.normal(shape=(1, 4, 12, 64))
+
+        dk, dv = cache.update_and_fetch(k, v)
+        mx.eval(dv)
+
+        self.assertIsNone(dk)
+        self.assertEqual(cache.estimator_mode, "prod")
+        self.assertEqual(cache._k_bits, 3)
+        self.assertEqual(cache._v_bits, 4)
+        self.assertIsNotNone(cache._k_qjl_indices)
+        self.assertIsNotNone(cache._k_qjl_gamma)
+        self.assertEqual(dv.shape, v.shape)
+
+    def test_rotorquant_prod_fused_scores_match_dequantized_reference(self):
+        """Test RotorQuant prod score path matches explicit dequantized attention."""
+        cache = RotorQuantKVCache(bits=4, estimator_mode="prod")
+        cache.min_fused_tokens = 0
+
+        k = mx.random.normal(shape=(1, 1, 9, 64))
+        v = mx.random.normal(shape=(1, 1, 9, 64))
+        _, dv = cache.update_and_fetch(k, v)
+
+        q = mx.random.normal(shape=(1, 1, 3, 64))
+        scale = 1.0 / (64**0.5)
+        ref_k = cache._dequantize_keys(dtype=k.dtype)
+        ref_v = cache._dequantize_values(dtype=v.dtype)
+        ref = scaled_dot_product_attention(q, ref_k, ref_v, None, scale, None)
+        out = scaled_dot_product_attention(q, None, dv, cache, scale, None)
+        mx.eval(ref, out)
+
+        self.assertTrue(mx.allclose(out, ref, atol=1e-4, rtol=1e-4))
+
+    def test_make_prompt_cache_turboquant_keeps_edge_layers_fp16(self):
+        """Test TurboQuant cache routing keeps first/last layers uncompressed."""
+        model = DummyCacheModel([KVCache() for _ in range(6)])
+
+        prompt_cache = make_prompt_cache(
+            model,
+            turbo_kv_bits=3,
+            turbo_fp16_layers=1,
+        )
+
+        self.assertIsInstance(prompt_cache[0], KVCache)
+        self.assertIsInstance(prompt_cache[-1], KVCache)
+        for c in prompt_cache[1:-1]:
+            self.assertIsInstance(c, TurboQuantKVCache)
+            self.assertEqual(c.turbo_bits, 3)
+
+    def test_make_prompt_cache_turboquant_preserves_mixed_caches(self):
+        """Test non-KV cache entries survive TurboQuant routing unchanged."""
+        model = DummyCacheModel(
+            [
+                KVCache(),
+                ArraysCache(size=2),
+                KVCache(),
+                ArraysCache(size=2),
+                KVCache(),
+            ]
+        )
+
+        prompt_cache = make_prompt_cache(
+            model,
+            turbo_kv_bits=3.5,
+            turbo_fp16_layers=1,
+        )
+
+        self.assertIsInstance(prompt_cache[0], KVCache)
+        self.assertIsInstance(prompt_cache[1], ArraysCache)
+        self.assertIsInstance(prompt_cache[2], TurboQuantKVCache)
+        self.assertEqual(prompt_cache[2].turbo_bits, 3.5)
+        self.assertIsInstance(prompt_cache[3], ArraysCache)
+        self.assertIsInstance(prompt_cache[4], KVCache)
+
+    def test_make_prompt_cache_turboquant_forwards_decode_buffer(self):
+        """Test TurboQuant cache routing forwards decode-buffer mode."""
+        model = DummyCacheModel([KVCache() for _ in range(4)])
+
+        prompt_cache = make_prompt_cache(
+            model,
+            turbo_kv_bits=3,
+            turbo_fp16_layers=1,
+            turbo_decode_buffer=True,
+        )
+
+        self.assertIsInstance(prompt_cache[0], KVCache)
+        self.assertIsInstance(prompt_cache[-1], KVCache)
+        self.assertTrue(prompt_cache[1].decode_buffer)
+        self.assertTrue(prompt_cache[2].decode_buffer)
+
+    def test_make_prompt_cache_rotorquant_keeps_edge_layers_fp16(self):
+        """Test RotorQuant cache routing keeps first/last layers uncompressed."""
+        model = DummyCacheModel([KVCache() for _ in range(6)])
+
+        prompt_cache = make_prompt_cache(
+            model,
+            rotor_kv_bits=4,
+            rotor_fp16_layers=1,
+        )
+
+        self.assertIsInstance(prompt_cache[0], KVCache)
+        self.assertIsInstance(prompt_cache[-1], KVCache)
+        for c in prompt_cache[1:-1]:
+            self.assertIsInstance(c, RotorQuantKVCache)
+            self.assertEqual(c.turbo_bits, 4)
+            self.assertEqual(c.rotation_mode, "rotorquant")
+
+    def test_make_prompt_cache_rotorquant_preserves_mixed_caches(self):
+        """Test non-KV cache entries survive RotorQuant routing unchanged."""
+        model = DummyCacheModel(
+            [
+                KVCache(),
+                ArraysCache(size=2),
+                KVCache(),
+                ArraysCache(size=2),
+                KVCache(),
+            ]
+        )
+
+        prompt_cache = make_prompt_cache(
+            model,
+            rotor_kv_bits=4,
+            rotor_fp16_layers=1,
+        )
+
+        self.assertIsInstance(prompt_cache[0], KVCache)
+        self.assertIsInstance(prompt_cache[1], ArraysCache)
+        self.assertIsInstance(prompt_cache[2], RotorQuantKVCache)
+        self.assertEqual(prompt_cache[2].rotation_mode, "rotorquant")
+        self.assertIsInstance(prompt_cache[3], ArraysCache)
+        self.assertIsInstance(prompt_cache[4], KVCache)
+
+    def test_make_prompt_cache_rotorquant_forwards_decode_buffer(self):
+        """Test RotorQuant cache routing forwards decode-buffer mode."""
+        model = DummyCacheModel([KVCache() for _ in range(4)])
+
+        prompt_cache = make_prompt_cache(
+            model,
+            rotor_kv_bits=4,
+            rotor_fp16_layers=1,
+            rotor_decode_buffer=True,
+        )
+
+        self.assertIsInstance(prompt_cache[0], KVCache)
+        self.assertIsInstance(prompt_cache[-1], KVCache)
+        self.assertTrue(prompt_cache[1].decode_buffer)
+        self.assertTrue(prompt_cache[2].decode_buffer)
+        self.assertEqual(prompt_cache[1].rotation_mode, "rotorquant")
+
+    def test_maybe_quantize_kv_cache_keeps_edge_layers_fp16(self):
+        prompt_cache = [KVCache() for _ in range(5)]
+        x = mx.random.uniform(shape=(1, 2, 4, 64))
+        for cache in prompt_cache:
+            cache.update_and_fetch(x, x)
+
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            quantized_kv_start=0,
+            kv_group_size=64,
+            kv_bits=4,
+            quantized_kv_fp16_layers=1,
+        )
+
+        self.assertIsInstance(prompt_cache[0], KVCache)
+        self.assertIsInstance(prompt_cache[-1], KVCache)
+        for layer in prompt_cache[1:-1]:
+            self.assertIsInstance(layer, QuantizedKVCache)
+
+    def test_maybe_quantize_kv_cache_quantizes_all_layers_without_edges(self):
+        prompt_cache = [KVCache() for _ in range(4)]
+        x = mx.random.uniform(shape=(1, 2, 4, 64))
+        for cache in prompt_cache:
+            cache.update_and_fetch(x, x)
+
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            quantized_kv_start=0,
+            kv_group_size=64,
+            kv_bits=4,
+            quantized_kv_fp16_layers=0,
+        )
+
+        for layer in prompt_cache:
+            self.assertIsInstance(layer, QuantizedKVCache)
+
+    def test_make_prompt_cache_rejects_multiple_compressed_backends(self):
+        """Test cache creation rejects mixing TurboQuant and RotorQuant."""
+        model = DummyCacheModel([KVCache() for _ in range(2)])
+
+        with self.assertRaises(ValueError):
+            make_prompt_cache(
+                model,
+                turbo_kv_bits=3,
+                rotor_kv_bits=4,
+            )
+
+    def test_make_prompt_cache_turboquant_rejects_rotating_fallback(self):
+        """Test TurboQuant creation is explicit when only rotating fallback exists."""
+
+        class DummyNoCacheModel:
+            def __init__(self):
+                self.layers = [object()] * 2
+
+        with self.assertRaises(ValueError):
+            make_prompt_cache(
+                DummyNoCacheModel(),
+                max_kv_size=32,
+                turbo_kv_bits=3,
+            )
+
+    def test_turboquant_pack_unpack_roundtrip(self):
+        """Test low-bit pack/unpack preserves the legacy packed layout."""
+        values = mx.random.randint(0, 8, shape=(2, 3, 5, 17), dtype=mx.uint32)
+        for bits in (1, 2, 3, 4):
+            max_level = 1 << bits
+            clipped = (values % max_level).astype(mx.uint8)
+            packed = _pack(clipped, bits)
+            unpacked = _unpack(packed, bits, clipped.shape[-1])
+            self.assertTrue(mx.array_equal(clipped, unpacked))
+
+    def test_turboquant_qjl_packed_residual_matches_unpacked(self):
+        """Test packed QJL signs preserve the same 1-bit residual payload."""
+        unit_vectors = mx.random.normal(shape=(1, 2, 7, 64))
+        mse_vectors = mx.random.normal(shape=(1, 2, 7, 64))
+        projection, projection_t = _cached_qjl_projection(64, mode="wht")
+
+        unpacked_signs, gamma = _quantize_qjl_residual(
+            unit_vectors,
+            mse_vectors,
+            projection_t,
+        )
+        packed_signs, packed_gamma = _quantize_qjl_residual_packed(
+            unit_vectors,
+            mse_vectors,
+            projection_t,
+        )
+        recovered_signs = _unpack(packed_signs, 1, unit_vectors.shape[-1])
+
+        self.assertTrue(mx.array_equal(unpacked_signs, recovered_signs))
+        self.assertTrue(mx.allclose(gamma, packed_gamma))
+
+    def test_turboquant_metal_qjl_score_matches_reference(self):
+        """Test packed QJL score kernel matches unpacked sign-dot reference."""
+        if not _metal_available():
+            self.skipTest("Metal QJL score kernel unavailable")
+
+        q_proj = mx.random.normal(shape=(1, 2, 3, 64), dtype=mx.float32)
+        sign_bits = mx.random.randint(0, 2, shape=(1, 2, 5, 64), dtype=mx.uint32)
+        packed = _pack(sign_bits.astype(mx.uint8), 1)
+        norms = mx.random.uniform(shape=(1, 2, 5), low=0.5, high=1.5)
+        residual_norms = mx.random.uniform(shape=(1, 2, 5), low=0.05, high=0.5)
+        scale = mx.array([0.123], dtype=mx.float32)
+
+        fast = _metal_qjl_score(q_proj, norms, residual_norms, packed, scale)
+        unpacked = _unpack(packed, 1, q_proj.shape[-1]).astype(mx.float32)
+        signs = unpacked * 2.0 - 1.0
+        ref = (
+            mx.einsum("bhrd,bhtd->bhrt", q_proj, signs)
+            * norms[:, :, None, :]
+            * residual_norms[:, :, None, :]
+            * scale[0]
+        )
+        mx.eval(fast, ref)
+
+        self.assertTrue(mx.allclose(fast, ref, atol=1e-5, rtol=1e-5))
+
     def test_turboquant_prod_mode_uses_qjl_residual(self):
         """Test prod mode stores a separate 1-bit QJL residual for keys."""
         c = TurboQuantKVCache(bits=3, estimator_mode="prod")
@@ -771,6 +1208,42 @@ class TestPromptCache(unittest.TestCase):
         self.assertLess(c._k_indices.shape[-1], c._v_indices.shape[-1])
         self.assertEqual(dk.shape, k.shape)
         self.assertEqual(dv.shape, v.shape)
+
+    def test_turboquant_prod_mode_without_qjl_falls_back_to_plain_key_quant(self):
+        """Test prod-mode ablation can disable QJL and still quantize cleanly."""
+        c = TurboQuantKVCache(bits=4, estimator_mode="prod", qjl_residual=False)
+        k = mx.random.normal(shape=(1, 4, 12, 64))
+        v = mx.random.normal(shape=(1, 4, 12, 64))
+        dk, dv = c.update_and_fetch(k, v)
+        mx.eval(dk, dv)
+
+        self.assertEqual(c.estimator_mode, "prod")
+        self.assertFalse(c.qjl_residual)
+        self.assertEqual(c._k_bits, 4)
+        self.assertIsNone(c._k_qjl_indices)
+        self.assertIsNone(c._k_qjl_gamma)
+        self.assertEqual(dk.shape, k.shape)
+        self.assertEqual(dv.shape, v.shape)
+
+    def test_turboquant_max_cache_tokens_evicts_oldest_tokens(self):
+        """Test TurboQuant can evict the oldest compressed tokens to a fixed window."""
+        c = TurboQuantKVCache(bits=4, max_cache_tokens=10)
+        k0 = mx.random.normal(shape=(1, 2, 8, 32))
+        v0 = mx.random.normal(shape=(1, 2, 8, 32))
+        k1 = mx.random.normal(shape=(1, 2, 8, 32))
+        v1 = mx.random.normal(shape=(1, 2, 8, 32))
+
+        c.update_and_fetch(k0, v0)
+        dk, dv = c.update_and_fetch(k1, v1)
+        ref_k = mx.concatenate([k0, k1], axis=2)[..., -10:, :]
+        ref_v = mx.concatenate([v0, v1], axis=2)[..., -10:, :]
+        mx.eval(dk, dv, ref_k, ref_v)
+
+        self.assertEqual(c.offset, 10)
+        self.assertEqual(dk.shape[2], 10)
+        self.assertEqual(dv.shape[2], 10)
+        self.assertLess(float(mx.max(mx.abs(dk - ref_k))), 2.0)
+        self.assertLess(float(mx.max(mx.abs(dv - ref_v))), 2.0)
 
     def test_turboquant_prod_correction_is_unbiased_in_expectation(self):
         """Test prod-mode QJL correction improves score reconstruction in expectation."""
@@ -802,6 +1275,101 @@ class TestPromptCache(unittest.TestCase):
         mx.eval(err_mse, err_prod)
 
         self.assertLess(float(err_prod), float(err_mse))
+
+    def test_turboquant_decode_buffer_incremental_matches_raw_cache(self):
+        """Test decode-buffer mode keeps a live raw KV mirror for fast decode."""
+        mx.random.seed(0)
+        k = mx.random.normal(shape=(1, 4, 8, 64))
+        v = mx.random.normal(shape=(1, 4, 8, 64))
+        k_next = mx.random.normal(shape=(1, 4, 1, 64))
+        v_next = mx.random.normal(shape=(1, 4, 1, 64))
+
+        buffered = TurboQuantKVCache(
+            bits=3,
+            estimator_mode="prod",
+            qjl_projection_mode="wht",
+            decode_buffer=True,
+        )
+
+        buffered.update_and_fetch(k, v)
+        dk, dv = buffered.update_and_fetch(k_next, v_next)
+        ref_k = mx.concatenate([k, k_next], axis=2)
+        ref_v = mx.concatenate([v, v_next], axis=2)
+        diff_k = mx.max(mx.abs(dk - ref_k))
+        diff_v = mx.max(mx.abs(dv - ref_v))
+        mx.eval(diff_k, diff_v, dk, dv)
+
+        self.assertIsNotNone(buffered._k_deq_buf)
+        self.assertIsNotNone(buffered._v_deq_buf)
+        self.assertEqual(buffered._deq_offset, 9)
+        self.assertLess(float(diff_k), 1e-5)
+        self.assertLess(float(diff_v), 1e-5)
+
+    def test_turboquant_decode_buffer_uses_raw_append_before_materialize(self):
+        """Test decode-buffer mode reuses raw K/V tensors instead of re-dequantizing them."""
+        mx.random.seed(0)
+        k = mx.random.normal(shape=(1, 4, 8, 64))
+        v = mx.random.normal(shape=(1, 4, 8, 64))
+        k_next = mx.random.normal(shape=(1, 4, 1, 64))
+        v_next = mx.random.normal(shape=(1, 4, 1, 64))
+
+        cache = TurboQuantKVCache(
+            bits=3,
+            estimator_mode="prod",
+            qjl_projection_mode="wht",
+            decode_buffer=True,
+        )
+
+        def _unexpected_materialize(*_args, **_kwargs):
+            raise AssertionError("decode buffer should append raw keys/values directly")
+
+        cache._materialize_decode_buffer = _unexpected_materialize
+        dk, dv = cache.update_and_fetch(k, v)
+        dk2, dv2 = cache.update_and_fetch(k_next, v_next)
+        mx.eval(dk, dv, dk2, dv2)
+
+        self.assertEqual(dk.shape, k.shape)
+        self.assertEqual(dv.shape, v.shape)
+        self.assertEqual(dk2.shape[-2], 9)
+        self.assertEqual(dv2.shape[-2], 9)
+        self.assertEqual(cache._deq_offset, 9)
+
+    def test_turboquant_recent_buffer_attention_matches_reference(self):
+        """Test mixed compressed+recent-buffer attention matches materialized KV."""
+        if not hasattr(mx.fast, "turboquant_qk_packed_scores"):
+            self.skipTest("packed TurboQuant score kernel unavailable")
+        if not hasattr(mx.fast, "turboquant_av_packed_values_batched"):
+            self.skipTest("packed TurboQuant AV kernel unavailable")
+
+        mx.random.seed(0)
+        cache = TurboQuantKVCache(bits=4, buffer_size=4, flush_batch_size=4)
+        cache._fused_enabled = True
+        cache.min_fused_tokens = 0
+
+        k0 = mx.random.normal(shape=(1, 4, 8, 64))
+        v0 = mx.random.normal(shape=(1, 4, 8, 64))
+        cache.update_and_fetch(k0, v0)
+
+        self.assertEqual(cache.compressed_tokens, 0)
+        self.assertEqual(cache.buffer_tokens, 8)
+
+        k1 = mx.random.normal(shape=(1, 4, 1, 64))
+        v1 = mx.random.normal(shape=(1, 4, 1, 64))
+        buf_k, buf_v = cache.update_and_fetch(k1, v1)
+
+        self.assertEqual(cache.compressed_tokens, 5)
+        self.assertEqual(cache.buffer_tokens, 4)
+        self.assertEqual(cache.size(), 9)
+        self.assertEqual(buf_k.shape[-2], 4)
+        self.assertEqual(buf_v.shape[-2], 4)
+
+        q = mx.random.normal(shape=(1, 4, 1, 64))
+        scale = 1.0 / (64**0.5)
+        ref_k = cache._dequantize_keys(dtype=k1.dtype)
+        ref_v = cache._dequantize_values(dtype=v1.dtype)
+        ref = scaled_dot_product_attention(q, ref_k, ref_v, None, scale, None)
+        out = scaled_dot_product_attention(q, buf_k, buf_v, cache, scale, None)
+        self.assertTrue(mx.allclose(out, ref, atol=1e-4, rtol=1e-4))
 
     def test_turboquant_rotor3_mode(self):
         """Test TurboQuant rotor3 mode wiring and cache state."""
@@ -845,6 +1413,95 @@ class TestPromptCache(unittest.TestCase):
             self.assertEqual(lc.estimator_mode, "prod")
             self.assertIsNotNone(lc._k_qjl_indices)
             self.assertIsNotNone(lc._k_qjl_gamma)
+
+    def test_turboquant_fractional_save_load(self):
+        """Test fractional-bit TurboQuant cache save/load roundtrip."""
+        cache_file = os.path.join(self.test_dir, "turbo_cache_frac.safetensors")
+
+        cache = [TurboQuantKVCache(bits=3.5)]
+        x = mx.random.uniform(shape=(1, 8, 10, 64))
+        cache[0].update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+
+        self.assertEqual(len(loaded_cache), 1)
+        loaded = loaded_cache[0]
+        self.assertEqual(loaded.offset, 10)
+        self.assertEqual(float(loaded.turbo_bits), 3.5)
+        self.assertTrue(loaded._fractional_split)
+        self.assertIsNotNone(loaded._split_low_cache)
+        self.assertIsNotNone(loaded._split_high_cache)
+
+    def test_turboquant_decode_buffer_save_load(self):
+        """Test decode-buffer flag survives save/load roundtrip."""
+        cache_file = os.path.join(self.test_dir, "turbo_cache_decode_buffer.safetensors")
+
+        cache = [TurboQuantKVCache(bits=3, decode_buffer=True)]
+        x = mx.random.normal(shape=(1, 8, 10, 64))
+        cache[0].update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self.assertTrue(loaded_cache[0].decode_buffer)
+
+    def test_turboquant_experimental_flags_save_load(self):
+        """Test asymmetric bits, QJL ablation, and max window survive save/load."""
+        cache_file = os.path.join(self.test_dir, "turbo_cache_experimental.safetensors")
+
+        cache = [
+            TurboQuantKVCache(
+                bits=4,
+                key_bits=4,
+                value_bits=3,
+                estimator_mode="prod",
+                qjl_residual=False,
+                max_cache_tokens=12,
+            )
+        ]
+        x = mx.random.normal(shape=(1, 8, 10, 64))
+        cache[0].update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        loaded = loaded_cache[0]
+        self.assertEqual(loaded.key_bits_override, 4)
+        self.assertEqual(loaded.value_bits_override, 3)
+        self.assertFalse(loaded.qjl_residual)
+        self.assertEqual(loaded.max_cache_tokens, 12)
+
+    def test_rotorquant_save_load(self):
+        """Test RotorQuant cache save/load roundtrip."""
+        cache_file = os.path.join(self.test_dir, "rotor_cache.safetensors")
+
+        cache = [RotorQuantKVCache(bits=4, decode_buffer=True)]
+        x = mx.random.normal(shape=(1, 8, 10, 64))
+        cache[0].update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+
+        self.assertEqual(len(loaded_cache), 1)
+        self.assertIsInstance(loaded_cache[0], RotorQuantKVCache)
+        self.assertTrue(loaded_cache[0].decode_buffer)
+        self.assertEqual(loaded_cache[0].rotation_mode, "rotorquant")
+
+    def test_rotorquant_prod_save_load(self):
+        """Test RotorQuant prod-mode cache save/load roundtrip."""
+        cache_file = os.path.join(self.test_dir, "rotor_cache_prod.safetensors")
+
+        cache = [RotorQuantKVCache(bits=4, estimator_mode="prod")]
+        x = mx.random.normal(shape=(1, 8, 10, 64))
+        cache[0].update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+
+        self.assertEqual(len(loaded_cache), 1)
+        self.assertIsInstance(loaded_cache[0], RotorQuantKVCache)
+        self.assertEqual(loaded_cache[0].estimator_mode, "prod")
+        self.assertIsNotNone(loaded_cache[0]._k_qjl_indices)
+        self.assertIsNotNone(loaded_cache[0]._k_qjl_gamma)
 
     def test_turboquant_fused_av_matches_dequantized_values(self):
         """Test fused AV restores values back to the model basis."""

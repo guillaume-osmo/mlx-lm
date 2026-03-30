@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
 
@@ -13,6 +13,25 @@ from .base import create_causal_mask
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
+    turbo_kv_bits: Optional[float] = None,
+    turbo_key_bits: Optional[int] = None,
+    turbo_value_bits: Optional[int] = None,
+    turbo_fp16_layers: int = 1,
+    turbo_rotation_mode: str = "dense",
+    turbo_estimator_mode: str = "mse",
+    turbo_qjl_residual: bool = True,
+    turbo_qjl_projection_mode: str = "auto",
+    turbo_sparse_v_tau: Optional[float] = None,
+    turbo_decode_buffer: bool = False,
+    turbo_buffer_size: int = 0,
+    turbo_flush_batch_size: int = 0,
+    turbo_max_kv_size: int = 0,
+    rotor_kv_bits: Optional[float] = None,
+    rotor_fp16_layers: int = 1,
+    rotor_estimator_mode: str = "mse",
+    rotor_qjl_projection_mode: str = "auto",
+    rotor_sparse_v_tau: Optional[float] = None,
+    rotor_decode_buffer: bool = False,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -25,11 +44,130 @@ def make_prompt_cache(
         max_kv_size (Optional[int]): If provided and the model does not have a
             ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
             size of ``max_kv_size``
+        turbo_kv_bits (Optional[float]): If provided, create TurboQuant KV
+            caches at the given bit width. Fractional values such as ``2.5``
+            and ``3.5`` are supported.
+        turbo_key_bits (Optional[int]): Optional integer bit-width override for
+            TurboQuant keys.
+        turbo_value_bits (Optional[int]): Optional integer bit-width override
+            for TurboQuant values.
+        turbo_fp16_layers (int): Number of first/last layers to keep in their
+            default cache form when using TurboQuant.
+        turbo_rotation_mode (str): TurboQuant rotation mode.
+        turbo_estimator_mode (str): TurboQuant estimator mode.
+        turbo_qjl_residual (bool): Enable the 1-bit QJL residual correction on
+            TurboQuant keys when using ``prod`` mode.
+        turbo_qjl_projection_mode (str): TurboQuant QJL projection backend for
+            ``prod`` mode.
+        turbo_sparse_v_tau (Optional[float]): Optional sparse-V threshold for
+            TurboQuant fused decode attention.
+        turbo_decode_buffer (bool): Keep a running dequantized K/V decode buffer
+            and only materialize new tokens on incremental decode steps.
+        turbo_buffer_size (int): Keep this many recent tokens in FP16 and
+            merge them with compressed history during decode.
+        turbo_flush_batch_size (int): Compress buffered tokens in batches of
+            this size when the recent-token buffer overflows.
+        turbo_max_kv_size (int): If positive, keep only this many TurboQuant
+            tokens by evicting the oldest compressed tokens.
+        rotor_kv_bits (Optional[float]): If provided, create RotorQuant KV
+            caches at the given bit width.
+        rotor_fp16_layers (int): Number of first/last layers to keep in their
+            default cache form when using RotorQuant.
+        rotor_estimator_mode (str): RotorQuant estimator mode.
+        rotor_qjl_projection_mode (str): RotorQuant QJL projection backend for
+            ``prod`` mode.
+        rotor_sparse_v_tau (Optional[float]): Optional sparse-V threshold for
+            RotorQuant fused decode attention.
+        rotor_decode_buffer (bool): Keep a running dequantized K/V decode
+            buffer and only materialize new tokens on incremental decode steps.
     """
+    if turbo_kv_bits is not None and rotor_kv_bits is not None:
+        raise ValueError(
+            "Select at most one compressed KV backend at a time: "
+            "TurboQuant or RotorQuant."
+        )
+
+    def _to_turboquant(cache_obj):
+        if not isinstance(cache_obj, KVCache):
+            return cache_obj
+        return cache_obj.to_turboquant(
+            bits=turbo_kv_bits,
+            key_bits=turbo_key_bits,
+            value_bits=turbo_value_bits,
+            rotation_mode=turbo_rotation_mode,
+            estimator_mode=turbo_estimator_mode,
+            qjl_residual=turbo_qjl_residual,
+            sparse_v_tau=turbo_sparse_v_tau,
+            qjl_projection_mode=turbo_qjl_projection_mode,
+            decode_buffer=turbo_decode_buffer,
+            buffer_size=turbo_buffer_size,
+            flush_batch_size=turbo_flush_batch_size,
+            max_cache_tokens=turbo_max_kv_size,
+        )
+
+    def _to_rotorquant(cache_obj):
+        if not isinstance(cache_obj, KVCache):
+            return cache_obj
+        return cache_obj.to_rotorquant(
+            bits=rotor_kv_bits,
+            estimator_mode=rotor_estimator_mode,
+            sparse_v_tau=rotor_sparse_v_tau,
+            qjl_projection_mode=rotor_qjl_projection_mode,
+            decode_buffer=rotor_decode_buffer,
+        )
+
     if hasattr(model, "make_cache"):
-        return model.make_cache()
+        default_cache = model.make_cache()
+        if turbo_kv_bits is None and rotor_kv_bits is None:
+            return default_cache
+
+        num_layers = len(default_cache)
+        fp16_layers = (
+            turbo_fp16_layers if turbo_kv_bits is not None else rotor_fp16_layers
+        )
+        to_backend = _to_turboquant if turbo_kv_bits is not None else _to_rotorquant
+        return [
+            c
+            if i < fp16_layers or i >= num_layers - fp16_layers
+            else to_backend(c)
+            for i, c in enumerate(default_cache)
+        ]
 
     num_layers = len(model.layers)
+    if turbo_kv_bits is not None or rotor_kv_bits is not None:
+        if max_kv_size is not None:
+            raise ValueError(
+                "Compressed prompt cache creation does not currently support "
+                "--max-kv-size on models without make_cache()."
+            )
+        if turbo_kv_bits is not None:
+            return [
+                KVCache().to_turboquant(
+                    bits=turbo_kv_bits,
+                    key_bits=turbo_key_bits,
+                    value_bits=turbo_value_bits,
+                    rotation_mode=turbo_rotation_mode,
+                    estimator_mode=turbo_estimator_mode,
+                    qjl_residual=turbo_qjl_residual,
+                    sparse_v_tau=turbo_sparse_v_tau,
+                    qjl_projection_mode=turbo_qjl_projection_mode,
+                    decode_buffer=turbo_decode_buffer,
+                    buffer_size=turbo_buffer_size,
+                    flush_batch_size=turbo_flush_batch_size,
+                    max_cache_tokens=turbo_max_kv_size,
+                )
+                for _ in range(num_layers)
+            ]
+        return [
+            KVCache().to_rotorquant(
+                bits=rotor_kv_bits,
+                estimator_mode=rotor_estimator_mode,
+                sparse_v_tau=rotor_sparse_v_tau,
+                qjl_projection_mode=rotor_qjl_projection_mode,
+                decode_buffer=rotor_decode_buffer,
+            )
+            for _ in range(num_layers)
+        ]
     if max_kv_size is not None:
         return [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
@@ -82,6 +220,10 @@ def load_prompt_cache(file_name, return_metadata=False):
             from .turboquant import TurboQuantKVCache
 
             return TurboQuantKVCache
+        if name == "RotorQuantKVCache":
+            from .rotorquant import RotorQuantKVCache
+
+            return RotorQuantKVCache
         raise KeyError(f"Unknown cache class: {name}")
 
     cache = [
@@ -400,10 +542,18 @@ class KVCache(_BaseCache):
 
     def to_turboquant(
         self,
-        bits: int = 4,
+        bits: float = 4,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
         rotation_mode: str = "dense",
         estimator_mode: str = "mse",
+        qjl_residual: bool = True,
         sparse_v_tau: Optional[float] = None,
+        qjl_projection_mode: str = "auto",
+        decode_buffer: bool = False,
+        buffer_size: int = 0,
+        flush_batch_size: int = 0,
+        max_cache_tokens: int = 0,
     ):
         """Convert to TurboQuant compressed cache (experimental).
 
@@ -411,22 +561,49 @@ class KVCache(_BaseCache):
         See :class:`~mlx_lm.models.turboquant.TurboQuantKVCache` for details.
 
         Args:
-            bits (int): Quantization bits per coordinate (2-4). Default: ``4``.
+            bits (float): Quantization bits per coordinate (2-4). Fractional
+                values such as ``2.5`` and ``3.5`` split the head dimension
+                across neighboring integer bit-widths. Default: ``4``.
+            key_bits (Optional[int]): Optional integer bit-width override for
+                keys.
+            value_bits (Optional[int]): Optional integer bit-width override for
+                values.
             rotation_mode (str): Rotation type: ``dense``, ``rotor3``, or
                 ``rotorquant``.
             estimator_mode (str): TurboQuant estimator mode, ``mse`` or ``prod``.
                 ``prod`` uses a paper-faithful key path with ``bits - 1`` MSE
                 bits plus a packed 1-bit QJL residual correction.
+            qjl_residual (bool): Enable the 1-bit QJL residual correction on
+                keys when using ``prod`` mode.
             sparse_v_tau (Optional[float]): Optional threshold for sparse-V gating
                 during fused decode attention.
+            qjl_projection_mode (str): QJL projection backend for ``prod`` mode:
+                ``auto``, ``dense``, or ``wht``.
+            decode_buffer (bool): Keep a running dequantized K/V decode buffer
+                for incremental decode instead of relying on the packed fused
+                attention path.
+            buffer_size (int): Keep this many recent tokens uncompressed and
+                merge them with compressed history during decode.
+            flush_batch_size (int): Compress buffered overflow in batches of
+                this size.
+            max_cache_tokens (int): If positive, keep only this many TurboQuant
+                tokens by evicting the oldest compressed tokens.
         """
         from .turboquant import TurboQuantKVCache
 
         tq_cache = TurboQuantKVCache(
             bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
             rotation_mode=rotation_mode,
             estimator_mode=estimator_mode,
+            qjl_residual=qjl_residual,
             sparse_v_tau=sparse_v_tau,
+            qjl_projection_mode=qjl_projection_mode,
+            decode_buffer=decode_buffer,
+            buffer_size=buffer_size,
+            flush_batch_size=flush_batch_size,
+            max_cache_tokens=max_cache_tokens,
         )
         if self.keys is not None:
             tq_cache.update_and_fetch(
@@ -434,6 +611,83 @@ class KVCache(_BaseCache):
                 self.values[..., : self.offset, :],
             )
         return tq_cache
+
+    def to_turbo_quantized(
+        self,
+        bits: float = 4,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotation_mode: str = "dense",
+        estimator_mode: str = "mse",
+        qjl_residual: bool = True,
+        sparse_v_tau: Optional[float] = None,
+        qjl_projection_mode: str = "auto",
+        decode_buffer: bool = False,
+        buffer_size: int = 0,
+        flush_batch_size: int = 0,
+        max_cache_tokens: int = 0,
+    ):
+        """Backwards-compatible alias for TurboQuant cache conversion."""
+        return self.to_turboquant(
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            rotation_mode=rotation_mode,
+            estimator_mode=estimator_mode,
+            qjl_residual=qjl_residual,
+            sparse_v_tau=sparse_v_tau,
+            qjl_projection_mode=qjl_projection_mode,
+            decode_buffer=decode_buffer,
+            buffer_size=buffer_size,
+            flush_batch_size=flush_batch_size,
+            max_cache_tokens=max_cache_tokens,
+        )
+
+    def to_rotorquant(
+        self,
+        bits: float = 4,
+        estimator_mode: str = "mse",
+        sparse_v_tau: Optional[float] = None,
+        qjl_projection_mode: str = "auto",
+        decode_buffer: bool = False,
+    ):
+        """Convert to RotorQuant compressed cache.
+
+        RotorQuant uses Rotor/Quaternion-parameterized 3D block rotations
+        instead of a dense random orthogonal matrix.
+        """
+        from .rotorquant import RotorQuantKVCache
+
+        rq_cache = RotorQuantKVCache(
+            bits=bits,
+            estimator_mode=estimator_mode,
+            sparse_v_tau=sparse_v_tau,
+            qjl_projection_mode=qjl_projection_mode,
+            decode_buffer=decode_buffer,
+        )
+        if self.keys is not None:
+            rq_cache.update_and_fetch(
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+        return rq_cache
+
+    def to_rotor_quantized(
+        self,
+        bits: float = 4,
+        estimator_mode: str = "mse",
+        sparse_v_tau: Optional[float] = None,
+        qjl_projection_mode: str = "auto",
+        decode_buffer: bool = False,
+    ):
+        """Backwards-compatible alias for RotorQuant cache conversion."""
+        return self.to_rotorquant(
+            bits=bits,
+            estimator_mode=estimator_mode,
+            sparse_v_tau=sparse_v_tau,
+            qjl_projection_mode=qjl_projection_mode,
+            decode_buffer=decode_buffer,
+        )
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)

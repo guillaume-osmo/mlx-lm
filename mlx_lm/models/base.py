@@ -120,6 +120,72 @@ def _resolve_turbo_sparse_v_tau(cache) -> Optional[float]:
     except ValueError:
         return None
 
+
+def _resolve_turbo_min_fused_tokens(cache) -> int:
+    threshold = getattr(cache, "min_fused_tokens", None)
+    if threshold is not None:
+        try:
+            return max(0, int(threshold))
+        except (TypeError, ValueError):
+            return 0
+    raw = os.environ.get("MLX_TQ_MIN_FUSED_TOKENS")
+    if raw is None:
+        return 256
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 256
+
+
+def _apply_turbo_mask(scores, mask, cache, n_compressed: int = 0):
+    if mask is None:
+        return scores
+    if isinstance(mask, str):
+        qL, kL = scores.shape[-2:]
+        offset = max(0, getattr(cache, "offset", kL) - qL)
+        q_indices = mx.arange(offset, offset + qL)
+        k_indices = mx.arange(kL)
+        mask = q_indices[:, None] >= k_indices[None]
+    if mask.dtype == mx.bool_:
+        if n_compressed > 0 and mask.shape[-1] == scores.shape[-1] - n_compressed:
+            prefix = mx.ones((*mask.shape[:-1], n_compressed), dtype=mx.bool_)
+            mask = mx.concatenate([prefix, mask], axis=-1)
+        scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+    else:
+        if n_compressed > 0 and mask.shape[-1] == scores.shape[-1] - n_compressed:
+            prefix = mx.zeros((*mask.shape[:-1], n_compressed), dtype=mask.dtype)
+            mask = mx.concatenate([prefix, mask], axis=-1)
+        scores += mask
+    return scores
+
+
+def _matmul_buffer_values(probs, values):
+    n_q_heads = probs.shape[1]
+    n_kv_heads = values.shape[1]
+    if n_q_heads % n_kv_heads == 0 and n_q_heads != n_kv_heads:
+        n_repeats = n_q_heads // n_kv_heads
+        probs = mx.reshape(
+            probs,
+            (
+                probs.shape[0],
+                n_kv_heads,
+                n_repeats,
+                probs.shape[2],
+                probs.shape[3],
+            ),
+        )
+        out = probs @ mx.expand_dims(values, axis=2)
+        return mx.reshape(
+            out,
+            (
+                out.shape[0],
+                n_q_heads,
+                out.shape[3],
+                out.shape[4],
+            ),
+        )
+    return probs @ values
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -141,26 +207,64 @@ def scaled_dot_product_attention(
                 return out
 
     # TurboQuant fused path: score directly from packed keys to avoid full key dequantization.
-    if hasattr(cache, "fused_scores") and keys is None:
+    if hasattr(cache, "fused_scores") and (
+        keys is None
+        or values is None
+        or getattr(cache, "buffer_tokens", 0) > 0
+    ):
         if sinks is not None:
             raise ValueError("TurboQuant fused SDPA does not support attention sinks.")
         queries_scaled = queries * scale
+        compressed_tokens = int(getattr(cache, "compressed_tokens", 0) or 0)
+        if (
+            compressed_tokens > 0
+            and compressed_tokens < _resolve_turbo_min_fused_tokens(cache)
+            and hasattr(cache, "_dequantize_keys")
+            and hasattr(cache, "_dequantize_values")
+        ):
+            full_keys = cache._dequantize_keys(dtype=queries.dtype)
+            full_values = cache._dequantize_values(dtype=values.dtype if values is not None else queries.dtype)
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                full_keys,
+                full_values,
+                scale=scale,
+                mask=mask,
+                sinks=sinks,
+            )
         scores = cache.fused_scores(queries_scaled)
         if scores is not None:
-            if mask is not None:
-                if isinstance(mask, str):
-                    qL, kL = scores.shape[-2:]
-                    q_indices = mx.arange(kL - qL, kL)
-                    k_indices = mx.arange(kL)
-                    mask = q_indices[:, None] >= k_indices[None]
-                if mask.dtype == mx.bool_:
-                    scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+            n_compressed = scores.shape[-1]
+            buffer_scores = None
+            if keys is not None and values is not None and keys.shape[-2] > 0:
+                n_q_heads = queries.shape[1]
+                n_kv_heads = keys.shape[1]
+                if n_q_heads % n_kv_heads == 0 and n_q_heads != n_kv_heads:
+                    n_repeats = n_q_heads // n_kv_heads
+                    buf_keys = mx.repeat(keys, n_repeats, axis=1)
                 else:
-                    scores += mask
+                    buf_keys = keys
+                buffer_scores = (queries @ mx.transpose(buf_keys, (0, 1, 3, 2))) * scale
+                scores = mx.concatenate([scores, buffer_scores], axis=-1)
+
+            scores = _apply_turbo_mask(scores, mask, cache, n_compressed if buffer_scores is not None else 0)
             probs = mx.softmax(scores, axis=-1, precise=True)
             if sparse_v_tau is not None and sparse_v_tau > 0:
                 probs = mx.where(probs >= sparse_v_tau, probs, 0.0)
                 probs = probs / mx.maximum(mx.sum(probs, axis=-1, keepdims=True), 1e-8)
+
+            if buffer_scores is not None:
+                comp_probs = probs[..., :n_compressed]
+                buf_probs = probs[..., n_compressed:]
+                out = None
+                if hasattr(cache, "fused_av"):
+                    out = cache.fused_av(comp_probs)
+                if out is None and hasattr(cache, "_dequantize_values"):
+                    comp_values = cache._dequantize_values(limit=n_compressed, dtype=values.dtype)
+                    out = _matmul_buffer_values(comp_probs, comp_values)
+                if out is None:
+                    raise ValueError("TurboQuant fused AV path unavailable for compressed-buffer decode.")
+                return out + _matmul_buffer_values(buf_probs, values)
 
             if values is None and hasattr(cache, "fused_av"):
                 out = cache.fused_av(probs)
@@ -170,31 +274,7 @@ def scaled_dot_product_attention(
             if values is None:
                 raise ValueError("TurboQuant fused AV path unavailable for this decode step.")
 
-            n_q_heads = probs.shape[1]
-            n_kv_heads = values.shape[1]
-            if n_q_heads % n_kv_heads == 0 and n_q_heads != n_kv_heads:
-                n_repeats = n_q_heads // n_kv_heads
-                probs = mx.reshape(
-                    probs,
-                    (
-                        probs.shape[0],
-                        n_kv_heads,
-                        n_repeats,
-                        probs.shape[2],
-                        probs.shape[3],
-                    ),
-                )
-                out = probs @ mx.expand_dims(values, axis=2)
-                return mx.reshape(
-                    out,
-                    (
-                        out.shape[0],
-                        n_q_heads,
-                        out.shape[3],
-                        out.shape[4],
-                    ),
-                )
-            return probs @ values
+            return _matmul_buffer_values(probs, values)
 
     if hasattr(cache, "bits"):
         if sinks is not None:

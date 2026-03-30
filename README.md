@@ -234,6 +234,64 @@ requests that use the same context. See the
 [example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
 for more usage details.
 
+### Experimental TurboQuant Tuning
+
+This branch includes experimental TurboQuant KV-cache compression features in
+`mlx_lm.generate` / `mlx_lm.benchmark`, including:
+
+- separate key/value bit-widths
+- optional 1-bit QJL residual correction for `prod` mode
+- FP16 "edge layers" to protect the first/last layers
+- an incremental decode buffer for faster compressed decode
+- optional oldest-token eviction for fixed-size compressed caches
+
+The main practical takeaway from the current Apple Silicon runs is simple:
+there is **no single best compressed-KV profile across models**. The best
+speed/accuracy trade-off is model-dependent, so the recommended way to use
+TurboQuant in this branch is to start with a per-model profile and then tune
+around it.
+
+Current local reference points on an M3 Max (greedy decode, exact-match check
+against native on the generated suffix):
+
+| Model | Native gen tok/s | Recommended compressed profile | Compressed gen tok/s | Cache MB | Notes |
+| --- | ---: | --- | ---: | ---: | --- |
+| `mlx-community/Qwen2.5-7B-Instruct-4bit` | `41.2` | `--turbo-kv-bits 4 --turbo-key-bits 3 --turbo-value-bits 4 --turbo-estimator-mode prod --turbo-disable-qjl --turbo-fp16-layers 4 --turbo-decode-buffer` | `40.1` | `54.4` | exact, ~`4.4x` smaller cache; QJL was not consistently helpful on this 7B family |
+| `mlx-community/Qwen2.5-32B-Instruct-4bit` | `9.9` | `--turbo-kv-bits 4 --turbo-estimator-mode mse --turbo-fp16-layers 2 --turbo-decode-buffer` | `8.8` | `273.0` | exact, ~`4.0x` smaller cache; the simple 4-bit MSE profile was the most robust winner |
+| `mlx-community/Qwen3.5-35B-A3B-4bit` | `18.0` | `--turbo-kv-bits 4 --turbo-estimator-mode prod --turbo-fp16-layers 2 --turbo-qjl-projection-mode wht --turbo-decode-buffer` | `18.4` | `86.8` | exact, ~`2.3x` smaller cache; this hybrid model benefited from the QJL-backed `prod` path |
+
+Two extra notes are worth keeping in mind:
+
+1. `--turbo-max-kv-size` is currently an aggressive research knob, not a safe
+   default. Naive fixed-size eviction reduced cache size further but clearly
+   hurt exactness in the current runs.
+2. Fractional `2.5` / `3.5`-bit TurboQuant modes are implemented and exact in
+   this branch, but they currently use a safe split-cache fallback that is not
+   yet a speed winner. If you care primarily about throughput, start with the
+   integer-bit profiles above.
+
+Example benchmark command:
+
+```bash
+mlx_lm.benchmark \
+  --model mlx-community/Qwen3.5-35B-A3B-4bit \
+  --prompt-tokens 8192 \
+  --generation-tokens 16 \
+  --turbo-kv-bits 4 \
+  --turbo-estimator-mode prod \
+  --turbo-fp16-layers 2 \
+  --turbo-qjl-projection-mode wht \
+  --turbo-decode-buffer
+```
+
+If you are unsure where to start:
+
+- start with plain `4-bit mse`
+- try asymmetric `K/V` bits next
+- enable `prod` + QJL only if it helps on your target model
+- treat fixed-size eviction as a separate experiment, not as the baseline
+- benchmark on the exact model family you care about before generalizing
+
 ### Supported Models
 
 `mlx-lm` supports thousands of LLMs available on the Hugging Face Hub. If the
