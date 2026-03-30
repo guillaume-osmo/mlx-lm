@@ -260,14 +260,41 @@ buffer maintenance. If that overhead is not amortized well by the target
 architecture and workload, the run will become smaller in memory but not
 necessarily faster in tokens/sec.
 
-Current local reference points on an M3 Max (greedy decode, exact-match check
-against native on the generated suffix):
+Measured on this exact machine:
 
-| Model | Native gen tok/s | Recommended compressed profile | Compressed gen tok/s | Cache MB | Notes |
-| --- | ---: | --- | ---: | ---: | --- |
-| `mlx-community/Qwen2.5-7B-Instruct-4bit` | `41.2` | `--turbo-kv-bits 4 --turbo-key-bits 3 --turbo-value-bits 4 --turbo-estimator-mode prod --turbo-disable-qjl --turbo-fp16-layers 4 --turbo-decode-buffer` | `40.1` | `54.4` | exact, ~`4.4x` smaller cache; QJL was not consistently helpful on this 7B family |
-| `mlx-community/Qwen2.5-32B-Instruct-4bit` | `9.9` | `--turbo-kv-bits 4 --turbo-estimator-mode mse --turbo-fp16-layers 2 --turbo-decode-buffer` | `8.8` | `273.0` | exact, ~`4.0x` smaller cache; the simple 4-bit MSE profile was the most robust winner |
-| `mlx-community/Qwen3.5-35B-A3B-4bit` | `18.0` | `--turbo-kv-bits 4 --turbo-estimator-mode prod --turbo-fp16-layers 2 --turbo-qjl-projection-mode wht --turbo-decode-buffer` | `18.4` | `86.8` | exact, ~`2.3x` smaller cache; this hybrid model benefited from the QJL-backed `prod` path |
+- Apple M3 Max
+- 16 CPU cores
+- 128 GB unified memory
+
+Current local reference points on this machine (greedy decode, exact-match
+check against native on the generated suffix):
+
+| Model | Workload | Native gen tok/s | Recommended compressed profile | Compressed gen tok/s | Cache MB | Notes |
+| --- | --- | ---: | --- | ---: | ---: | --- |
+| `mlx-community/Qwen2.5-7B-Instruct-4bit` | `4096` prompt / `16` decode | `41.2` | `--turbo-kv-bits 4 --turbo-key-bits 3 --turbo-value-bits 4 --turbo-estimator-mode prod --turbo-disable-qjl --turbo-fp16-layers 4 --turbo-decode-buffer` | `40.1` | `54.4` | exact, `-2.7%` decode speed vs native, `-77.1%` cache; QJL was not consistently helpful on this 7B family |
+| `mlx-community/Qwen2.5-32B-Instruct-4bit` | `4096` prompt / `16` decode | `9.9` | `--turbo-kv-bits 4 --turbo-estimator-mode mse --turbo-fp16-layers 2 --turbo-decode-buffer` | `8.8` | `273.0` | exact, `-11.2%` decode speed vs native, `-74.9%` cache; the simple 4-bit MSE profile was the most robust winner |
+| `mlx-community/Qwen3.5-35B-A3B-4bit` | `8192` prompt / `16` decode | `18.0` | `--turbo-kv-bits 4 --turbo-estimator-mode prod --turbo-fp16-layers 2 --turbo-qjl-projection-mode wht --turbo-decode-buffer` | `18.4` | `86.8` | exact, `+1.8%` decode speed vs native, `-55.8%` cache; this hybrid model benefited from the QJL-backed `prod` path |
+
+These numbers are the main reason this branch recommends a model-tuned
+workflow instead of a single “paper” profile:
+
+- on some families, compressed KV is almost free in throughput
+- on some families, compressed KV is mainly a memory win
+- and on some families, the best path changes depending on whether QJL helps
+
+The underlying reason is that this MLX implementation still pays a real
+preprocessing bill before the fast attention path can benefit:
+
+- rotate / normalize keys and values
+- quantize and pack indices
+- optionally compute and apply the QJL residual correction
+- maintain the incremental decode buffer
+
+That preprocessing cost is exactly why this branch can be **much smaller in
+cache memory without automatically matching native speed**. If the model
+architecture amortizes the compressed path well, you can win on both. If it
+does not, you still get the memory reduction, but the tokens/sec gain may stay
+flat or even regress slightly.
 
 Two extra notes are worth keeping in mind:
 
