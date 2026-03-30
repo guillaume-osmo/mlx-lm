@@ -251,6 +251,15 @@ speed/accuracy trade-off is model-dependent, so the recommended way to use
 TurboQuant in this branch is to start with a per-model profile and then tune
 around it.
 
+This also means that paper-level results should be treated as a direction, not
+as a drop-in expectation for every model on MLX. In practice, **memory
+reduction transfers much more reliably than speedups**. Speed can improve on
+some model families, but the compressed path still pays a real preprocessing
+cost for rotation, quantization, packing, optional QJL correction, and decode
+buffer maintenance. If that overhead is not amortized well by the target
+architecture and workload, the run will become smaller in memory but not
+necessarily faster in tokens/sec.
+
 Current local reference points on an M3 Max (greedy decode, exact-match check
 against native on the generated suffix):
 
@@ -269,6 +278,50 @@ Two extra notes are worth keeping in mind:
    this branch, but they currently use a safe split-cache fallback that is not
    yet a speed winner. If you care primarily about throughput, start with the
    integer-bit profiles above.
+
+#### What the Main Options Mean
+
+If you just want the best practical profile, these are the important knobs:
+
+- `--turbo-kv-bits N`
+  Turn on TurboQuant compression at `N` bits. In the current MLX path, `4`
+  bits is the safest starting point for real workloads.
+- `--turbo-key-bits K --turbo-value-bits V`
+  Override key and value precision separately. This is useful when keys are
+  more sensitive than values and can improve the speed/accuracy compromise on
+  some models.
+- `--turbo-estimator-mode mse`
+  The simplest and most robust option. Start here first.
+- `--turbo-estimator-mode prod`
+  A more aggressive path that can help on some models, especially when paired
+  with QJL, but should always be benchmarked on the target model family.
+- `--turbo-disable-qjl`
+  Turns off the 1-bit QJL residual correction in `prod` mode. This can help or
+  hurt depending on the model. It is not a universally good or bad toggle.
+- `--turbo-fp16-layers N`
+  Keep the first `N` and last `N` layers in their default FP16 cache form.
+  This is one of the most useful stability knobs in practice.
+- `--turbo-decode-buffer`
+  Keeps a live dequantized decode buffer to reduce the decode penalty of
+  compressed KV. This is usually the right default when throughput matters.
+- `--turbo-max-kv-size`
+  Enforces a hard compressed-cache limit by evicting the oldest tokens. This
+  saves more memory, but should be treated as a separate experiment because it
+  can easily hurt accuracy.
+
+#### Practical Decision Rule
+
+If your goal is a strong speed/accuracy compromise on Apple Silicon, the most
+reliable workflow today is:
+
+1. Benchmark native first.
+2. Benchmark `4-bit mse`.
+3. Try `--turbo-fp16-layers`.
+4. Try asymmetric `K/V` bits.
+5. Only then test `prod` and `QJL`.
+
+In other words: **do not assume a paper profile transfers directly**. Benchmark
+and tune on the exact model family you care about.
 
 Example benchmark command:
 
