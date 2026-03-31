@@ -288,9 +288,9 @@ property of these runs, not a blanket guarantee for every prompt.
 | --- | --- | --- | ---: | ---: | --- | --- | --- |
 | `mlx-community/Qwen2.5-7B-Instruct-4bit` | `4096` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off** | `43.4` | `39.8` | `238.0 -> 54.4` | `16/16` | strong memory win, moderate speed cost |
 | `mlx-community/Qwen2.5-32B-Instruct-4bit` | `4096` prompt / `16` decode | `mse`, `4-bit` | `9.8` | `10.1` | `1088.0 -> 273.0` | `16/16` | best current dense 32B profile |
-| `mlx-community/Qwen3.5-35B-A3B-4bit` | `16384` prompt / `50` decode | `prod`, `K=3`, `V=4`, QJL **off**, dense rotation, fused on, late-5 FP16 layers | `33.48` | `34.53` | `356.41 -> 231.52` | `50/50` | fastest exact long-context profile so far |
-| `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `46.54` | `42.87` | `288.0 -> 90.65` | `16/16` | very good compromise |
-| `mlx-community/Meta-Llama-3.1-8B-Instruct-8bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `27.69` | `27.81` | `288.0 -> 90.65` | `16/16` | cache win at speed parity |
+| `mlx-community/Qwen3.5-35B-A3B-4bit` | `16384` prompt / `50` decode | `prod`, `K=3`, `V=4`, QJL **off**, dense rotation, fused on, late-5 FP16 layers | `34.56` | `35.52` | `356.41 -> 231.52` | `50/50` | exact, smaller cache, slightly faster than native on the 2-trial tie-break |
+| `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `44.48` | `43.41` | `288.0 -> 76.55` | `16/16` | very good compromise |
+| `mlx-community/Meta-Llama-3.1-8B-Instruct-8bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `26.01` | `24.57` | `288.0 -> 76.55` | `16/16` | exact with a strong cache reduction |
 | `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `107.38` | `119.74` | `432.0 -> 157.62` | `16/16` | best speed+memory result so far |
 
 These runs are why this branch now recommends a **model-tuned** workflow
@@ -341,6 +341,13 @@ For `Qwen3.5-35B-A3B-4bit`, the current best long-context variants are:
 - `speed`: keep late attention layers `[23, 27, 31, 35, 39]` in FP16
 - `balanced`: keep late attention layers `[31, 35, 39]` in FP16
 - `smallest exact cache`: keep just the first/last `2` compressible attention layers in FP16
+
+The same exact winner was also revalidated at `32768` prompt / `50` decode on
+this machine:
+
+- native: `8.76 tok/s`, `676.41 MB`
+- compressed exact winner: `9.12 tok/s`, `429.02 MB`
+- exact match: `50/50`
 
 Base `WHT` rotation is now available behind `--turbo-rotation-mode wht`. On the
 same exact `Qwen3.5 16K/50` workload it stayed `50/50` exact, but it **did not
