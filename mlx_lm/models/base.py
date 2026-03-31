@@ -1,6 +1,8 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+import math
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -105,6 +107,207 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+
+
+def _resolve_turbo_sparse_v_tau(cache) -> Optional[float]:
+    tau = getattr(cache, "sparse_v_tau", None)
+    if tau is not None:
+        return float(tau)
+    tau_env = os.environ.get("MLX_TQ_SPARSE_V_TAU")
+    if tau_env is None:
+        return None
+    try:
+        return float(tau_env)
+    except ValueError:
+        return None
+
+
+def _resolve_turbo_sparse_v_mode(cache) -> Optional[str]:
+    mode = getattr(cache, "sparse_v_mode", None)
+    if mode in ("fixed", "percentile", "adaptive"):
+        return mode
+    raw = os.environ.get("MLX_TQ_SPARSE_V_MODE")
+    if raw in ("fixed", "percentile", "adaptive"):
+        return raw
+    tau = _resolve_turbo_sparse_v_tau(cache)
+    if tau is not None and tau > 0:
+        return "fixed"
+    return None
+
+
+def _resolve_turbo_sparse_v_percentile(cache) -> Optional[float]:
+    percentile = getattr(cache, "sparse_v_percentile", None)
+    if percentile is not None:
+        return float(percentile)
+    raw = os.environ.get("MLX_TQ_SPARSE_V_PERCENTILE")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _resolve_turbo_sparse_v_adaptive(cache) -> tuple[float, float]:
+    early = getattr(cache, "sparse_v_early_multiplier", None)
+    late = getattr(cache, "sparse_v_late_multiplier", None)
+    if early is None:
+        raw = os.environ.get("MLX_TQ_SPARSE_V_EARLY_MULTIPLIER")
+        early = 1.25 if raw is None else raw
+    if late is None:
+        raw = os.environ.get("MLX_TQ_SPARSE_V_LATE_MULTIPLIER")
+        late = 0.75 if raw is None else raw
+    try:
+        early = float(early)
+    except (TypeError, ValueError):
+        early = 1.25
+    try:
+        late = float(late)
+    except (TypeError, ValueError):
+        late = 0.75
+    return early, late
+
+
+def _compute_turbo_sparse_v_mask(probs, cache):
+    mode = _resolve_turbo_sparse_v_mode(cache)
+    if mode is None:
+        return None
+
+    if mode == "fixed":
+        tau = _resolve_turbo_sparse_v_tau(cache)
+        if tau is None or tau <= 0:
+            return None
+        return probs >= tau
+
+    percentile = _resolve_turbo_sparse_v_percentile(cache)
+    if percentile is None or percentile <= 0:
+        return None
+
+    if mode == "adaptive":
+        layer_idx = max(0, int(getattr(cache, "layer_idx", 0) or 0))
+        num_layers = max(
+            layer_idx + 1,
+            int(getattr(cache, "num_layers", layer_idx + 1) or (layer_idx + 1)),
+        )
+        early_mult, late_mult = _resolve_turbo_sparse_v_adaptive(cache)
+        ratio = layer_idx / max(1, num_layers - 1)
+        percentile *= early_mult + (late_mult - early_mult) * ratio
+
+    percentile = min(max(percentile, 0.0), 99.9)
+    if percentile <= 0:
+        return None
+
+    n_tokens = probs.shape[-1]
+    drop_count = min(n_tokens - 1, max(0, int(math.ceil(n_tokens * percentile / 100.0))))
+    keep_count = max(1, n_tokens - drop_count)
+    keep_idx = mx.argsort(probs, axis=-1)[..., -keep_count:]
+    mask = mx.put_along_axis(
+        mx.zeros(probs.shape, dtype=mx.bool_),
+        keep_idx,
+        mx.ones(keep_idx.shape, dtype=mx.bool_),
+        axis=-1,
+    )
+    return mask
+
+
+def _apply_turbo_sparse_v(probs, cache):
+    mask = _compute_turbo_sparse_v_mask(probs, cache)
+    if mask is None:
+        return probs
+    probs = mx.where(mask, probs, 0.0)
+    denom = mx.maximum(mx.sum(probs, axis=-1, keepdims=True), 1e-8)
+    return probs / denom
+
+
+def _resolve_turbo_min_fused_tokens(cache) -> int:
+    threshold = getattr(cache, "min_fused_tokens", None)
+    if threshold is not None:
+        try:
+            return max(0, int(threshold))
+        except (TypeError, ValueError):
+            return 0
+    raw = os.environ.get("MLX_TQ_MIN_FUSED_TOKENS")
+    if raw is None:
+        return 256
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 256
+
+
+def _apply_turbo_mask(scores, mask, cache, n_compressed: int = 0):
+    if mask is None:
+        return scores
+    if isinstance(mask, str):
+        qL, kL = scores.shape[-2:]
+        offset = max(0, getattr(cache, "offset", kL) - qL)
+        q_indices = mx.arange(offset, offset + qL)
+        k_indices = mx.arange(kL)
+        mask = q_indices[:, None] >= k_indices[None]
+    if mask.dtype == mx.bool_:
+        if n_compressed > 0 and mask.shape[-1] == scores.shape[-1] - n_compressed:
+            prefix = mx.ones((*mask.shape[:-1], n_compressed), dtype=mx.bool_)
+            mask = mx.concatenate([prefix, mask], axis=-1)
+        scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+    else:
+        if n_compressed > 0 and mask.shape[-1] == scores.shape[-1] - n_compressed:
+            prefix = mx.zeros((*mask.shape[:-1], n_compressed), dtype=mask.dtype)
+            mask = mx.concatenate([prefix, mask], axis=-1)
+        scores += mask
+    return scores
+
+
+def _matmul_buffer_values(probs, values):
+    n_q_heads = probs.shape[1]
+    n_kv_heads = values.shape[1]
+    if n_q_heads % n_kv_heads == 0 and n_q_heads != n_kv_heads:
+        n_repeats = n_q_heads // n_kv_heads
+        probs = mx.reshape(
+            probs,
+            (
+                probs.shape[0],
+                n_kv_heads,
+                n_repeats,
+                probs.shape[2],
+                probs.shape[3],
+            ),
+        )
+        out = probs @ mx.expand_dims(values, axis=2)
+        return mx.reshape(
+            out,
+            (
+                out.shape[0],
+                n_q_heads,
+                out.shape[3],
+                out.shape[4],
+            ),
+        )
+    return probs @ values
+
+
+def _fast_scaled_dot_product_attention(queries, keys, values, *, scale, mask, sinks=None):
+    kwargs = dict(scale=scale, mask=mask)
+    if sinks is not None:
+        try:
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                sinks=sinks,
+                **kwargs,
+            )
+        except TypeError as e:
+            raise TypeError(
+                "This MLX runtime does not support attention sinks in "
+                "mx.fast.scaled_dot_product_attention()."
+            ) from e
+    return mx.fast.scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        **kwargs,
+    )
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -114,6 +317,87 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    sparse_v_mode = _resolve_turbo_sparse_v_mode(cache)
+    sparse_v_tau = _resolve_turbo_sparse_v_tau(cache)
+
+    # TurboQuant packed decode attention: QK + softmax + AV in one native op.
+    if hasattr(cache, "fused_attention") and keys is None and values is None:
+        if sinks is not None:
+            raise ValueError("TurboQuant fused SDPA does not support attention sinks.")
+        if mask is None and sparse_v_mode is None:
+            out = cache.fused_attention(queries * scale)
+            if out is not None:
+                return out
+
+    # TurboQuant fused path: score directly from packed keys to avoid full key dequantization.
+    if hasattr(cache, "fused_scores") and (
+        keys is None
+        or values is None
+        or getattr(cache, "buffer_tokens", 0) > 0
+    ):
+        if sinks is not None:
+            raise ValueError("TurboQuant fused SDPA does not support attention sinks.")
+        queries_scaled = queries * scale
+        compressed_tokens = int(getattr(cache, "compressed_tokens", 0) or 0)
+        if (
+            compressed_tokens > 0
+            and compressed_tokens < _resolve_turbo_min_fused_tokens(cache)
+            and hasattr(cache, "_dequantize_keys")
+            and hasattr(cache, "_dequantize_values")
+        ):
+            full_keys = cache._dequantize_keys(dtype=queries.dtype)
+            full_values = cache._dequantize_values(dtype=values.dtype if values is not None else queries.dtype)
+            return _fast_scaled_dot_product_attention(
+                queries,
+                full_keys,
+                full_values,
+                scale=scale,
+                mask=mask,
+                sinks=sinks,
+            )
+        scores = cache.fused_scores(queries_scaled)
+        if scores is not None:
+            n_compressed = scores.shape[-1]
+            buffer_scores = None
+            if keys is not None and values is not None and keys.shape[-2] > 0:
+                n_q_heads = queries.shape[1]
+                n_kv_heads = keys.shape[1]
+                if n_q_heads % n_kv_heads == 0 and n_q_heads != n_kv_heads:
+                    n_repeats = n_q_heads // n_kv_heads
+                    buf_keys = mx.repeat(keys, n_repeats, axis=1)
+                else:
+                    buf_keys = keys
+                buffer_scores = (queries @ mx.transpose(buf_keys, (0, 1, 3, 2))) * scale
+                scores = mx.concatenate([scores, buffer_scores], axis=-1)
+
+            scores = _apply_turbo_mask(scores, mask, cache, n_compressed if buffer_scores is not None else 0)
+            probs = mx.softmax(scores, axis=-1, precise=True)
+            if sparse_v_mode is not None or (sparse_v_tau is not None and sparse_v_tau > 0):
+                probs = _apply_turbo_sparse_v(probs, cache)
+
+            if buffer_scores is not None:
+                comp_probs = probs[..., :n_compressed]
+                buf_probs = probs[..., n_compressed:]
+                out = None
+                if hasattr(cache, "fused_av"):
+                    out = cache.fused_av(comp_probs)
+                if out is None and hasattr(cache, "_dequantize_values"):
+                    comp_values = cache._dequantize_values(limit=n_compressed, dtype=values.dtype)
+                    out = _matmul_buffer_values(comp_probs, comp_values)
+                if out is None:
+                    raise ValueError("TurboQuant fused AV path unavailable for compressed-buffer decode.")
+                return out + _matmul_buffer_values(buf_probs, values)
+
+            if values is None and hasattr(cache, "fused_av"):
+                out = cache.fused_av(probs)
+                if out is not None:
+                    return out
+
+            if values is None:
+                raise ValueError("TurboQuant fused AV path unavailable for this decode step.")
+
+            return _matmul_buffer_values(probs, values)
+
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
@@ -126,12 +410,12 @@ def scaled_dot_product_attention(
             group_size=cache.group_size,
             bits=cache.bits,
         )
-    else:
-        return mx.fast.scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale=scale,
-            mask=mask,
-            sinks=sinks,
-        )
+
+    return _fast_scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        scale=scale,
+        mask=mask,
+        sinks=sinks,
+    )

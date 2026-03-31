@@ -7,7 +7,7 @@ import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
-from mlx_lm.utils import pipeline_load, sharded_load
+from mlx_lm.utils import sharded_load
 
 
 def setup_arg_parser():
@@ -73,6 +73,141 @@ def setup_arg_parser():
         default=0,
         help="Delay between each test in seconds (default: 0)",
     )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Enable standard MLX quantized KV cache at the given bit width.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for standard MLX quantized KV cache.",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Start quantizing the KV cache from this step onward when --kv-bits is set.",
+    )
+    parser.add_argument(
+        "--quantized-kv-fp16-layers",
+        type=int,
+        default=0,
+        help="Keep this many first/last layers in FP16 when using standard MLX quantized KV cache.",
+    )
+    parser.add_argument(
+        "--turbo-kv-bits",
+        type=float,
+        default=None,
+        help="[Experimental] Enable TurboQuant KV cache compression (2-4 bits, fractional values like 2.5/3.5 supported).",
+    )
+    parser.add_argument(
+        "--turbo-key-bits",
+        type=int,
+        default=None,
+        help="[Experimental] Optional integer bit-width override for TurboQuant keys.",
+    )
+    parser.add_argument(
+        "--turbo-value-bits",
+        type=int,
+        default=None,
+        help="[Experimental] Optional integer bit-width override for TurboQuant values.",
+    )
+    parser.add_argument(
+        "--turbo-fp16-layers",
+        type=int,
+        default=1,
+        help="[Experimental] Number of first/last layers to keep in their default cache form when using TurboQuant.",
+    )
+    parser.add_argument(
+        "--turbo-fp16-layer-indices",
+        type=int,
+        nargs="*",
+        default=None,
+        help="[Experimental] Absolute layer indices to keep in FP16 when using TurboQuant. Overrides --turbo-fp16-layers when provided.",
+    )
+    parser.add_argument(
+        "--turbo-rotation-mode",
+        type=str,
+        choices=["dense", "wht", "rotor3", "rotorquant"],
+        default="dense",
+        help="[Experimental] TurboQuant rotation mode.",
+    )
+    parser.add_argument(
+        "--turbo-estimator-mode",
+        type=str,
+        choices=["mse", "prod"],
+        default="mse",
+        help="[Experimental] TurboQuant estimator mode.",
+    )
+    parser.add_argument(
+        "--turbo-qjl-projection-mode",
+        type=str,
+        choices=["auto", "dense", "wht"],
+        default="auto",
+        help="[Experimental] TurboQuant QJL projection backend for 'prod' mode.",
+    )
+    parser.add_argument(
+        "--turbo-disable-qjl",
+        action="store_true",
+        help="[Experimental] Disable the 1-bit QJL residual correction in TurboQuant prod mode.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-tau",
+        type=float,
+        default=None,
+        help="[Experimental] Optional sparse-V threshold in TurboQuant fused decode.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-mode",
+        type=str,
+        choices=["fixed", "percentile", "adaptive"],
+        default=None,
+        help="[Experimental] Sparse-V policy for TurboQuant fused decode.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-percentile",
+        type=float,
+        default=None,
+        help="[Experimental] Skip the bottom N%% of attention weights in sparse-V percentile/adaptive modes.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-early-multiplier",
+        type=float,
+        default=1.25,
+        help="[Experimental] Adaptive sparse-V multiplier for the first layer.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-late-multiplier",
+        type=float,
+        default=0.75,
+        help="[Experimental] Adaptive sparse-V multiplier for the last layer.",
+    )
+    parser.add_argument(
+        "--turbo-decode-buffer",
+        action="store_true",
+        help="[Experimental] Use an incremental dequantized K/V decode buffer for TurboQuant.",
+    )
+    parser.add_argument(
+        "--turbo-buffer-size",
+        type=int,
+        default=0,
+        help="[Experimental] Keep this many recent TurboQuant tokens in FP16 and merge them with compressed history during decode.",
+    )
+    parser.add_argument(
+        "--turbo-flush-batch-size",
+        type=int,
+        default=0,
+        help="[Experimental] Compress buffered TurboQuant overflow in batches of this size.",
+    )
+    parser.add_argument(
+        "--turbo-max-kv-size",
+        type=int,
+        default=0,
+        help="[Experimental] Keep at most this many TurboQuant tokens by evicting the oldest compressed tokens.",
+    )
     return parser
 
 
@@ -121,6 +256,28 @@ def main():
             prompt,
             max_tokens=generation_tokens,
             prefill_step_size=args.prefill_step_size,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            quantized_kv_fp16_layers=args.quantized_kv_fp16_layers,
+            turbo_kv_bits=args.turbo_kv_bits,
+            turbo_key_bits=args.turbo_key_bits,
+            turbo_value_bits=args.turbo_value_bits,
+            turbo_fp16_layers=args.turbo_fp16_layers,
+            turbo_fp16_layer_indices=args.turbo_fp16_layer_indices,
+            turbo_rotation_mode=args.turbo_rotation_mode,
+            turbo_estimator_mode=args.turbo_estimator_mode,
+            turbo_qjl_residual=not args.turbo_disable_qjl,
+            turbo_qjl_projection_mode=args.turbo_qjl_projection_mode,
+            turbo_sparse_v_tau=args.turbo_sparse_v_tau,
+            turbo_sparse_v_mode=args.turbo_sparse_v_mode,
+            turbo_sparse_v_percentile=args.turbo_sparse_v_percentile,
+            turbo_sparse_v_early_multiplier=args.turbo_sparse_v_early_multiplier,
+            turbo_sparse_v_late_multiplier=args.turbo_sparse_v_late_multiplier,
+            turbo_decode_buffer=args.turbo_decode_buffer,
+            turbo_buffer_size=args.turbo_buffer_size,
+            turbo_flush_batch_size=args.turbo_flush_batch_size,
+            turbo_max_kv_size=args.turbo_max_kv_size,
         ):
             pass
         return response
@@ -132,7 +289,18 @@ def main():
             prompts,
             max_tokens=generation_tokens,
             prefill_step_size=args.prefill_step_size,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
         ).stats
+
+    if batch_size > 1 and (
+        args.kv_bits is not None or args.turbo_kv_bits is not None
+    ):
+        rprint(
+            "[WARNING] Compressed KV benchmark flags are most meaningful for --batch-size 1; "
+            "running the regular batch path for this run."
+        )
 
     if batch_size == 1:
         _bench = single_bench

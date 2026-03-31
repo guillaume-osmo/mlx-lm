@@ -77,6 +77,13 @@ def setup_arg_parser():
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
     )
+    parser.add_argument(
+        "--quantized-kv-fp16-layers",
+        type=int,
+        default=0,
+        help="When --kv-bits is set, keep this many first/last layers in FP16 "
+        "and quantize only the middle layers.",
+    )
     return parser
 
 
@@ -131,6 +138,7 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        quantized_kv_fp16_layers=args.quantized_kv_fp16_layers,
         prompt_progress_callback=callback,
     ):
         pass

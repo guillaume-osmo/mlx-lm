@@ -50,6 +50,8 @@ MODEL_REMAPPING = {
     "joyai_llm_flash": "deepseek_v3",
     "kimi_k2": "deepseek_v3",
     "qwen2_5_vl": "qwen2_vl",
+    "qwen3_5_moe": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
 }
@@ -354,13 +356,15 @@ def load_model(
                 return False
             return f"{p}.scales" in weights
 
-        nn.quantize(
-            model,
+        quantize_kwargs = dict(
+            model=model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
-            mode=quantization.get("mode", "affine"),
             class_predicate=class_predicate,
         )
+        if "mode" in inspect.signature(nn.quantize).parameters:
+            quantize_kwargs["mode"] = quantization.get("mode", "affine")
+        nn.quantize(**quantize_kwargs)
 
     if (quantization := config.get("quantization", None)) is not None:
         _quantize(quantization)

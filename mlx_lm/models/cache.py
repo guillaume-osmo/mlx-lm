@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
 
@@ -15,6 +15,30 @@ from .base import create_causal_mask
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
+    turbo_kv_bits: Optional[float] = None,
+    turbo_key_bits: Optional[int] = None,
+    turbo_value_bits: Optional[int] = None,
+    turbo_fp16_layers: int = 1,
+    turbo_fp16_layer_indices: Optional[List[int]] = None,
+    turbo_rotation_mode: str = "dense",
+    turbo_estimator_mode: str = "mse",
+    turbo_qjl_residual: bool = True,
+    turbo_qjl_projection_mode: str = "auto",
+    turbo_sparse_v_tau: Optional[float] = None,
+    turbo_sparse_v_mode: Optional[str] = None,
+    turbo_sparse_v_percentile: Optional[float] = None,
+    turbo_sparse_v_early_multiplier: float = 1.25,
+    turbo_sparse_v_late_multiplier: float = 0.75,
+    turbo_decode_buffer: bool = False,
+    turbo_buffer_size: int = 0,
+    turbo_flush_batch_size: int = 0,
+    turbo_max_kv_size: int = 0,
+    rotor_kv_bits: Optional[float] = None,
+    rotor_fp16_layers: int = 1,
+    rotor_estimator_mode: str = "mse",
+    rotor_qjl_projection_mode: str = "auto",
+    rotor_sparse_v_tau: Optional[float] = None,
+    rotor_decode_buffer: bool = False,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -27,11 +51,187 @@ def make_prompt_cache(
         max_kv_size (Optional[int]): If provided and the model does not have a
             ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
             size of ``max_kv_size``
+        turbo_kv_bits (Optional[float]): If provided, create TurboQuant KV
+            caches at the given bit width. Fractional values such as ``2.5``
+            and ``3.5`` are supported.
+        turbo_key_bits (Optional[int]): Optional integer bit-width override for
+            TurboQuant keys.
+        turbo_value_bits (Optional[int]): Optional integer bit-width override
+            for TurboQuant values.
+        turbo_fp16_layers (int): Number of first/last layers to keep in their
+            default cache form when using TurboQuant.
+        turbo_fp16_layer_indices (Optional[List[int]]): Absolute layer indices
+            to keep in their default cache form when using TurboQuant. If
+            provided, this overrides ``turbo_fp16_layers``.
+        turbo_rotation_mode (str): TurboQuant rotation mode.
+        turbo_estimator_mode (str): TurboQuant estimator mode.
+        turbo_qjl_residual (bool): Enable the 1-bit QJL residual correction on
+            TurboQuant keys when using ``prod`` mode.
+        turbo_qjl_projection_mode (str): TurboQuant QJL projection backend for
+            ``prod`` mode.
+        turbo_sparse_v_tau (Optional[float]): Optional sparse-V threshold for
+            TurboQuant fused decode attention.
+        turbo_sparse_v_mode (Optional[str]): Sparse-V policy: ``fixed``,
+            ``percentile``, or ``adaptive``.
+        turbo_sparse_v_percentile (Optional[float]): Bottom percentage of
+            attention weights to skip when sparse-V mode is ``percentile`` or
+            ``adaptive``.
+        turbo_sparse_v_early_multiplier (float): Adaptive sparse-V multiplier
+            for the first layer.
+        turbo_sparse_v_late_multiplier (float): Adaptive sparse-V multiplier
+            for the last layer.
+        turbo_decode_buffer (bool): Keep a running dequantized K/V decode buffer
+            and only materialize new tokens on incremental decode steps.
+        turbo_buffer_size (int): Keep this many recent tokens in FP16 and
+            merge them with compressed history during decode.
+        turbo_flush_batch_size (int): Compress buffered tokens in batches of
+            this size when the recent-token buffer overflows.
+        turbo_max_kv_size (int): If positive, keep only this many TurboQuant
+            tokens by evicting the oldest compressed tokens.
+        rotor_kv_bits (Optional[float]): If provided, create RotorQuant KV
+            caches at the given bit width.
+        rotor_fp16_layers (int): Number of first/last layers to keep in their
+            default cache form when using RotorQuant.
+        rotor_estimator_mode (str): RotorQuant estimator mode.
+        rotor_qjl_projection_mode (str): RotorQuant QJL projection backend for
+            ``prod`` mode.
+        rotor_sparse_v_tau (Optional[float]): Optional sparse-V threshold for
+            RotorQuant fused decode attention.
+        rotor_decode_buffer (bool): Keep a running dequantized K/V decode
+            buffer and only materialize new tokens on incremental decode steps.
     """
+    if turbo_kv_bits is not None and rotor_kv_bits is not None:
+        raise ValueError(
+            "Select at most one compressed KV backend at a time: "
+            "TurboQuant or RotorQuant."
+        )
+
+    def _to_turboquant(cache_obj):
+        if not isinstance(cache_obj, KVCache):
+            return cache_obj
+        return cache_obj.to_turboquant(
+            bits=turbo_kv_bits,
+            key_bits=turbo_key_bits,
+            value_bits=turbo_value_bits,
+            rotation_mode=turbo_rotation_mode,
+            estimator_mode=turbo_estimator_mode,
+            qjl_residual=turbo_qjl_residual,
+            sparse_v_tau=turbo_sparse_v_tau,
+            sparse_v_mode=turbo_sparse_v_mode,
+            sparse_v_percentile=turbo_sparse_v_percentile,
+            sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+            sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
+            qjl_projection_mode=turbo_qjl_projection_mode,
+            decode_buffer=turbo_decode_buffer,
+            buffer_size=turbo_buffer_size,
+            flush_batch_size=turbo_flush_batch_size,
+            max_cache_tokens=turbo_max_kv_size,
+        )
+
+    def _to_rotorquant(cache_obj):
+        if not isinstance(cache_obj, KVCache):
+            return cache_obj
+        return cache_obj.to_rotorquant(
+            bits=rotor_kv_bits,
+            estimator_mode=rotor_estimator_mode,
+            sparse_v_tau=rotor_sparse_v_tau,
+            qjl_projection_mode=rotor_qjl_projection_mode,
+            decode_buffer=rotor_decode_buffer,
+        )
+
+    def _annotate_layers(caches):
+        num_layers = len(caches)
+        for i, cache_obj in enumerate(caches):
+            try:
+                setattr(cache_obj, "layer_idx", i)
+                setattr(cache_obj, "num_layers", num_layers)
+            except Exception:
+                pass
+        return caches
+
     if hasattr(model, "make_cache"):
-        return model.make_cache()
+        default_cache = _annotate_layers(model.make_cache())
+        if turbo_kv_bits is None and rotor_kv_bits is None:
+            return default_cache
+
+        num_layers = len(default_cache)
+        fp16_layers = (
+            turbo_fp16_layers if turbo_kv_bits is not None else rotor_fp16_layers
+        )
+        fp16_index_set = (
+            {int(i) for i in turbo_fp16_layer_indices}
+            if turbo_kv_bits is not None and turbo_fp16_layer_indices is not None
+            else None
+        )
+        to_backend = _to_turboquant if turbo_kv_bits is not None else _to_rotorquant
+        return _annotate_layers([
+            c
+            if (
+                (fp16_index_set is not None and i in fp16_index_set)
+                or (
+                    fp16_index_set is None
+                    and (i < fp16_layers or i >= num_layers - fp16_layers)
+                )
+            )
+            else to_backend(c)
+            for i, c in enumerate(default_cache)
+        ])
 
     num_layers = len(model.layers)
+    if turbo_kv_bits is not None or rotor_kv_bits is not None:
+        if max_kv_size is not None:
+            raise ValueError(
+                "Compressed prompt cache creation does not currently support "
+                "--max-kv-size on models without make_cache()."
+            )
+        if turbo_kv_bits is not None:
+            fp16_index_set = (
+                {int(i) for i in turbo_fp16_layer_indices}
+                if turbo_fp16_layer_indices is not None
+                else None
+            )
+            caches = []
+            for i in range(num_layers):
+                if (
+                    (fp16_index_set is not None and i in fp16_index_set)
+                    or (
+                        fp16_index_set is None
+                        and (i < turbo_fp16_layers or i >= num_layers - turbo_fp16_layers)
+                    )
+                ):
+                    caches.append(KVCache())
+                else:
+                    caches.append(
+                        KVCache().to_turboquant(
+                            bits=turbo_kv_bits,
+                            key_bits=turbo_key_bits,
+                            value_bits=turbo_value_bits,
+                            rotation_mode=turbo_rotation_mode,
+                            estimator_mode=turbo_estimator_mode,
+                            qjl_residual=turbo_qjl_residual,
+                            sparse_v_tau=turbo_sparse_v_tau,
+                            sparse_v_mode=turbo_sparse_v_mode,
+                            sparse_v_percentile=turbo_sparse_v_percentile,
+                            sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+                            sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
+                            qjl_projection_mode=turbo_qjl_projection_mode,
+                            decode_buffer=turbo_decode_buffer,
+                            buffer_size=turbo_buffer_size,
+                            flush_batch_size=turbo_flush_batch_size,
+                            max_cache_tokens=turbo_max_kv_size,
+                        )
+                    )
+            return _annotate_layers(caches)
+        return [
+            KVCache().to_rotorquant(
+                bits=rotor_kv_bits,
+                estimator_mode=rotor_estimator_mode,
+                sparse_v_tau=rotor_sparse_v_tau,
+                qjl_projection_mode=rotor_qjl_projection_mode,
+                decode_buffer=rotor_decode_buffer,
+            )
+            for _ in range(num_layers)
+        ]
     if max_kv_size is not None:
         return [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
@@ -76,8 +276,22 @@ def load_prompt_cache(file_name, return_metadata=False):
     arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
+    def _resolve_cache_class(name):
+        if name in globals():
+            return globals()[name]
+        # Lazy-load experimental cache types
+        if name == "TurboQuantKVCache":
+            from .turboquant import TurboQuantKVCache
+
+            return TurboQuantKVCache
+        if name == "RotorQuantKVCache":
+            from .rotorquant import RotorQuantKVCache
+
+            return RotorQuantKVCache
+        raise KeyError(f"Unknown cache class: {name}")
+
     cache = [
-        globals()[c].from_state(state, meta_state)
+        _resolve_cache_class(c).from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
     ]
     if return_metadata:
@@ -227,6 +441,218 @@ class ConcatenateKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+@dataclass
+class PromptTrieResult:
+    model: Any
+    exact: Optional[List[int]]
+    shorter: Optional[List[int]]
+    longer: Optional[List[int]]
+    common_prefix: int
+
+
+class PromptTrie:
+    def __init__(self):
+        self._trie = {}
+
+    def add(self, model: Any, tokens: List[int], value: Any):
+        if model not in self._trie:
+            self._trie[model] = {}
+
+        current = self._trie[model]
+        for tok in tokens:
+            if tok not in current:
+                current[tok] = {}
+            current = current[tok]
+        prev = current.get("__value__", None)
+        current["__value__"] = value
+        return prev
+
+    def get(self, model: Any, tokens: List[int]):
+        current = self._trie[model]
+        for tok in tokens:
+            current = current[tok]
+        return current["__value__"]
+
+    def pop(self, model: Any, tokens: List[int]):
+        path = [self._trie[model]]
+        for tok in tokens:
+            path.append(path[-1][tok])
+        value = path[-1].pop("__value__")
+        for i in range(len(tokens), 0, -1):
+            node = path[i]
+            parent = path[i - 1]
+            tok = tokens[i - 1]
+            if len(node) > 0:
+                break
+            del parent[tok]
+        return value
+
+    def pop_prefixes(self, model: Any, tokens: List[int]):
+        values = []
+        current = self._trie[model]
+        for i in range(len(tokens) - 1):
+            if "__value__" in current:
+                values.append((i, current.pop("__value__")))
+            current = current[tokens[i]]
+        return values
+
+    def search(self, model: Any, tokens: List[int]) -> PromptTrieResult:
+        if model not in self._trie:
+            return PromptTrieResult(model, None, None, None, 0)
+
+        current = self._trie[model]
+        last_index = -1
+        index = 0
+        while index < len(tokens) and tokens[index] in current:
+            current = current[tokens[index]]
+            if "__value__" in current:
+                last_index = index
+            index += 1
+
+        if last_index == len(tokens) - 1:
+            return PromptTrieResult(model, tokens, None, None, 0)
+
+        shorter = None
+        if last_index > 0:
+            shorter = tokens[: last_index + 1]
+
+        longer = None
+        common_prefix = index
+        if index > 0:
+            best = None
+            stack = [(current, [])]
+            while stack:
+                current, extra = stack.pop()
+                if "__value__" in current:
+                    if best is None or len(extra) < len(best):
+                        best = extra
+                elif best is None or len(extra) < len(best):
+                    for tok in current:
+                        stack.append((current[tok], extra + [tok]))
+            longer = tokens[:index] + best
+        return PromptTrieResult(model, None, shorter, longer, common_prefix)
+
+
+class LRUPromptCache:
+    @dataclass
+    class CacheEntry:
+        prompt_cache: List[Any]
+        nbytes: int
+
+    class CacheOrder:
+        def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
+            self._ordering = ordering
+            self._lrus = {k: deque() for k in ordering}
+
+        def __len__(self):
+            return sum(len(lru) for lru in self._lrus.values())
+
+        def push(self, model: Any, tokens: List[Any], cache_type: str = "assistant"):
+            self._lrus[cache_type].append((model, tokens))
+
+        def remove(self, model: Any, tokens: List[Any]):
+            for cache_type in self._ordering:
+                try:
+                    self._lrus[cache_type].remove((model, tokens))
+                    break
+                except ValueError:
+                    pass
+
+        def pop(self):
+            i = 0
+            while i + 1 < len(self._ordering):
+                lru_a = self._lrus[self._ordering[i]]
+                lru_b = self._lrus[self._ordering[i + 1]]
+                if len(lru_a) >= len(lru_b):
+                    return lru_a.popleft()
+                i += 1
+            return lru_b.popleft()
+
+    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+        self.max_size = max_size
+        self.max_bytes = max_bytes
+        self._trie = PromptTrie()
+        self._lru = LRUPromptCache.CacheOrder()
+        self._n_bytes = 0
+
+    def __len__(self):
+        return len(self._lru)
+
+    @property
+    def nbytes(self):
+        return self._n_bytes
+
+    def fetch_nearest_cache(self, model: Any, tokens: List[int]):
+        result = self._trie.search(model, tokens)
+        if result.exact is not None:
+            cache_entry = self._trie.get(result.model, result.exact)
+            return copy.deepcopy(cache_entry.prompt_cache), []
+
+        short_length = len(result.shorter) if result.shorter is not None else 0
+        if result.longer is not None and result.common_prefix > short_length:
+            cache_entry = self._trie.get(result.model, result.longer)
+            if can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                prefix = min(len(tokens) - 1, result.common_prefix)
+                num_to_trim = len(result.longer) - prefix
+                trim_prompt_cache(cache, num_to_trim)
+                return cache, tokens[prefix:]
+
+        if short_length > 0:
+            cache_entry = self._trie.get(result.model, result.shorter)
+            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+
+        return None, tokens
+
+    def insert_cache(
+        self,
+        model: Any,
+        tokens: List[int],
+        prompt_cache: List[Any],
+        *,
+        cache_type: str = "assistant",
+    ):
+        entry = LRUPromptCache.CacheEntry(
+            prompt_cache, sum(c.nbytes for c in prompt_cache)
+        )
+
+        self._n_bytes += entry.nbytes
+        prev = self._trie.add(model, tokens, entry)
+        if prev is not None:
+            self._n_bytes -= prev.nbytes
+            self._lru.remove(model, tokens)
+        self._lru.push(model, tokens, cache_type)
+
+        if can_trim_prompt_cache(prompt_cache):
+            for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
+                self._n_bytes -= entry.nbytes
+                self._lru.remove(model, tokens[:prefix_len])
+
+        if len(self._lru) > self.max_size:
+            model, tokens = self._lru.pop()
+            entry = self._trie.pop(model, tokens)
+            self._n_bytes -= entry.nbytes
+        while self._n_bytes > self.max_bytes:
+            model, tokens = self._lru.pop()
+            entry = self._trie.pop(model, tokens)
+            self._n_bytes -= entry.nbytes
+
+    def trim_to(
+        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
+    ):
+        n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
+        n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
+
+        while len(self._lru) > n_sequences:
+            model, tokens = self._lru.pop()
+            entry = self._trie.pop(model, tokens)
+            self._n_bytes -= entry.nbytes
+        while self._n_bytes > n_bytes:
+            model, tokens = self._lru.pop()
+            entry = self._trie.pop(model, tokens)
+            self._n_bytes -= entry.nbytes
 
 
 class QuantizedKVCache(_BaseCache):
@@ -389,6 +815,179 @@ class KVCache(_BaseCache):
                 self.values, group_size=group_size, bits=bits
             )
         return quant_cache
+
+    def to_turboquant(
+        self,
+        bits: float = 4,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotation_mode: str = "dense",
+        estimator_mode: str = "mse",
+        qjl_residual: bool = True,
+        sparse_v_tau: Optional[float] = None,
+        sparse_v_mode: Optional[str] = None,
+        sparse_v_percentile: Optional[float] = None,
+        sparse_v_early_multiplier: float = 1.25,
+        sparse_v_late_multiplier: float = 0.75,
+        qjl_projection_mode: str = "auto",
+        decode_buffer: bool = False,
+        buffer_size: int = 0,
+        flush_batch_size: int = 0,
+        max_cache_tokens: int = 0,
+    ):
+        """Convert to TurboQuant compressed cache (experimental).
+
+        Uses PolarQuant for data-oblivious KV cache compression at 2-4 bits.
+        See :class:`~mlx_lm.models.turboquant.TurboQuantKVCache` for details.
+
+        Args:
+            bits (float): Quantization bits per coordinate (2-4). Fractional
+                values such as ``2.5`` and ``3.5`` split the head dimension
+                across neighboring integer bit-widths. Default: ``4``.
+            key_bits (Optional[int]): Optional integer bit-width override for
+                keys.
+            value_bits (Optional[int]): Optional integer bit-width override for
+                values.
+            rotation_mode (str): Rotation type: ``dense``, ``rotor3``, or
+                ``rotorquant``.
+            estimator_mode (str): TurboQuant estimator mode, ``mse`` or ``prod``.
+                ``prod`` uses a paper-faithful key path with ``bits - 1`` MSE
+                bits plus a packed 1-bit QJL residual correction.
+            qjl_residual (bool): Enable the 1-bit QJL residual correction on
+                keys when using ``prod`` mode.
+            sparse_v_tau (Optional[float]): Optional threshold for sparse-V gating
+                during fused decode attention.
+            sparse_v_mode (Optional[str]): Sparse-V policy: ``fixed``,
+                ``percentile``, or ``adaptive``.
+            sparse_v_percentile (Optional[float]): Bottom percentage of weights
+                to skip in sparse-V percentile/adaptive modes.
+            sparse_v_early_multiplier (float): Adaptive sparse-V multiplier for
+                the first layer.
+            sparse_v_late_multiplier (float): Adaptive sparse-V multiplier for
+                the last layer.
+            qjl_projection_mode (str): QJL projection backend for ``prod`` mode:
+                ``auto``, ``dense``, or ``wht``.
+            decode_buffer (bool): Keep a running dequantized K/V decode buffer
+                for incremental decode instead of relying on the packed fused
+                attention path.
+            buffer_size (int): Keep this many recent tokens uncompressed and
+                merge them with compressed history during decode.
+            flush_batch_size (int): Compress buffered overflow in batches of
+                this size.
+            max_cache_tokens (int): If positive, keep only this many TurboQuant
+                tokens by evicting the oldest compressed tokens.
+        """
+        from .turboquant import TurboQuantKVCache
+
+        tq_cache = TurboQuantKVCache(
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            rotation_mode=rotation_mode,
+            estimator_mode=estimator_mode,
+            qjl_residual=qjl_residual,
+            sparse_v_tau=sparse_v_tau,
+            sparse_v_mode=sparse_v_mode,
+            sparse_v_percentile=sparse_v_percentile,
+            sparse_v_early_multiplier=sparse_v_early_multiplier,
+            sparse_v_late_multiplier=sparse_v_late_multiplier,
+            qjl_projection_mode=qjl_projection_mode,
+            decode_buffer=decode_buffer,
+            buffer_size=buffer_size,
+            flush_batch_size=flush_batch_size,
+            max_cache_tokens=max_cache_tokens,
+        )
+        if self.keys is not None:
+            tq_cache.update_and_fetch(
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+        return tq_cache
+
+    def to_turbo_quantized(
+        self,
+        bits: float = 4,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotation_mode: str = "dense",
+        estimator_mode: str = "mse",
+        qjl_residual: bool = True,
+        sparse_v_tau: Optional[float] = None,
+        sparse_v_mode: Optional[str] = None,
+        sparse_v_percentile: Optional[float] = None,
+        sparse_v_early_multiplier: float = 1.25,
+        sparse_v_late_multiplier: float = 0.75,
+        qjl_projection_mode: str = "auto",
+        decode_buffer: bool = False,
+        buffer_size: int = 0,
+        flush_batch_size: int = 0,
+        max_cache_tokens: int = 0,
+    ):
+        """Backwards-compatible alias for TurboQuant cache conversion."""
+        return self.to_turboquant(
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            rotation_mode=rotation_mode,
+            estimator_mode=estimator_mode,
+            qjl_residual=qjl_residual,
+            sparse_v_tau=sparse_v_tau,
+            sparse_v_mode=sparse_v_mode,
+            sparse_v_percentile=sparse_v_percentile,
+            sparse_v_early_multiplier=sparse_v_early_multiplier,
+            sparse_v_late_multiplier=sparse_v_late_multiplier,
+            qjl_projection_mode=qjl_projection_mode,
+            decode_buffer=decode_buffer,
+            buffer_size=buffer_size,
+            flush_batch_size=flush_batch_size,
+            max_cache_tokens=max_cache_tokens,
+        )
+
+    def to_rotorquant(
+        self,
+        bits: float = 4,
+        estimator_mode: str = "mse",
+        sparse_v_tau: Optional[float] = None,
+        qjl_projection_mode: str = "auto",
+        decode_buffer: bool = False,
+    ):
+        """Convert to RotorQuant compressed cache.
+
+        RotorQuant uses Rotor/Quaternion-parameterized 3D block rotations
+        instead of a dense random orthogonal matrix.
+        """
+        from .rotorquant import RotorQuantKVCache
+
+        rq_cache = RotorQuantKVCache(
+            bits=bits,
+            estimator_mode=estimator_mode,
+            sparse_v_tau=sparse_v_tau,
+            qjl_projection_mode=qjl_projection_mode,
+            decode_buffer=decode_buffer,
+        )
+        if self.keys is not None:
+            rq_cache.update_and_fetch(
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+        return rq_cache
+
+    def to_rotor_quantized(
+        self,
+        bits: float = 4,
+        estimator_mode: str = "mse",
+        sparse_v_tau: Optional[float] = None,
+        qjl_projection_mode: str = "auto",
+        decode_buffer: bool = False,
+    ):
+        """Backwards-compatible alias for RotorQuant cache conversion."""
+        return self.to_rotorquant(
+            bits=bits,
+            estimator_mode=estimator_mode,
+            sparse_v_tau=sparse_v_tau,
+            qjl_projection_mode=qjl_projection_mode,
+            decode_buffer=decode_buffer,
+        )
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
@@ -1383,224 +1982,3 @@ class BatchRotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
-
-
-@dataclass
-class PromptTrieResult:
-    model: Any
-    exact: Optional[List[int]]  # Exact match found
-    shorter: Optional[List[int]]  # Longest prefix with a value
-    longer: Optional[List[int]]  # Shortest value that extends beyond tokens
-    common_prefix: int  # Length of common prefix with any path
-
-
-class PromptTrie:
-    def __init__(self):
-        self._trie = {}
-
-    def add(self, model: Any, tokens: List[int], value: Any):
-        if model not in self._trie:
-            self._trie[model] = {}
-
-        current = self._trie[model]
-        for tok in tokens:
-            if tok not in current:
-                current[tok] = {}
-            current = current[tok]
-        prev = current.get("__value__", None)
-        current["__value__"] = value
-        return prev
-
-    def get(self, model: Any, tokens: List[int]):
-        current = self._trie[model]
-        for tok in tokens:
-            current = current[tok]
-        return current["__value__"]
-
-    def pop(self, model: Any, tokens: List[int]):
-        path = [self._trie[model]]
-        for tok in tokens:
-            path.append(path[-1][tok])
-        value = path[-1].pop("__value__")
-        for i in range(len(tokens), 0, -1):
-            node = path[i]
-            parent = path[i - 1]
-            tok = tokens[i - 1]
-            if len(node) > 0:
-                break
-            del parent[tok]
-        return value
-
-    def pop_prefixes(self, model: Any, tokens: List[int]):
-        values = []
-        current = self._trie[model]
-        for i in range(len(tokens) - 1):
-            if "__value__" in current:
-                values.append((i, current.pop("__value__")))
-            current = current[tokens[i]]
-        return values
-
-    def search(self, model: Any, tokens: List[int]) -> PromptTrieResult:
-        if model not in self._trie:
-            return PromptTrieResult(model, None, None, None, 0)
-
-        # Walk the tokens as far as we can
-        current = self._trie[model]
-        last_index = -1
-        index = 0
-        while index < len(tokens) and tokens[index] in current:
-            current = current[tokens[index]]
-            if "__value__" in current:
-                last_index = index
-            index += 1
-
-        # Got an exact match
-        if last_index == len(tokens) - 1:
-            return PromptTrieResult(model, tokens, None, None, 0)
-
-        # Check if we found a prefix at any point
-        shorter = None
-        if last_index > 0:
-            shorter = tokens[: last_index + 1]
-
-        # Check for sequences that are longer
-        longer = None
-        common_prefix = index
-        if index > 0:
-            best = None
-            stack = [(current, [])]
-            while stack:
-                current, extra = stack.pop()
-                if "__value__" in current:
-                    if best is None or len(extra) < len(best):
-                        best = extra
-                elif best is None or len(extra) < len(best):
-                    for tok in current:
-                        stack.append((current[tok], extra + [tok]))
-            longer = tokens[:index] + best
-        return PromptTrieResult(model, None, shorter, longer, common_prefix)
-
-
-class LRUPromptCache:
-    @dataclass
-    class CacheEntry:
-        prompt_cache: List[Any]
-        nbytes: int
-
-    class CacheOrder:
-        def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
-            self._ordering = ordering
-            self._lrus = {k: deque() for k in ordering}
-
-        def __len__(self):
-            return sum(len(lru) for lru in self._lrus.values())
-
-        def push(self, model: Any, tokens: List[Any], cache_type: str = "assistant"):
-            self._lrus[cache_type].append((model, tokens))
-
-        def remove(self, model: Any, tokens: List[Any]):
-            for cache_type in self._ordering:
-                try:
-                    self._lrus[cache_type].remove((model, tokens))
-                    break
-                except ValueError:
-                    pass
-
-        def pop(self):
-            i = 0
-            while i + 1 < len(self._ordering):
-                lru_a = self._lrus[self._ordering[i]]
-                lru_b = self._lrus[self._ordering[i + 1]]
-                if len(lru_a) >= len(lru_b):
-                    return lru_a.popleft()
-                i += 1
-            return lru_b.popleft()
-
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
-        self.max_size = max_size
-        self.max_bytes = max_bytes
-        self._trie = PromptTrie()
-        self._lru = LRUPromptCache.CacheOrder()
-        self._n_bytes = 0
-
-    def __len__(self):
-        return len(self._lru)
-
-    @property
-    def nbytes(self):
-        return self._n_bytes
-
-    def fetch_nearest_cache(self, model: Any, tokens: List[int]):
-        result = self._trie.search(model, tokens)
-        if result.exact is not None:
-            cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
-
-        short_length = len(result.shorter) if result.shorter is not None else 0
-        if result.longer is not None and result.common_prefix > short_length:
-            cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
-
-        if short_length > 0:
-            cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
-
-        return None, tokens
-
-    def insert_cache(
-        self,
-        model: Any,
-        tokens: List[int],
-        prompt_cache: List[Any],
-        *,
-        cache_type: str = "assistant",
-    ):
-        # Make the cache entry
-        entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache)
-        )
-
-        # Insert into the trie and update the byte counter and lru position
-        self._n_bytes += entry.nbytes
-        prev = self._trie.add(model, tokens, entry)
-        if prev is not None:
-            self._n_bytes -= prev.nbytes
-            self._lru.remove(model, tokens)
-        self._lru.push(model, tokens, cache_type)
-
-        # If it is a trimmable cache remove all prefixes cause they just take
-        # space
-        if can_trim_prompt_cache(prompt_cache):
-            for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
-                self._n_bytes -= entry.nbytes
-                self._lru.remove(model, tokens[:prefix_len])
-
-        # Ensure we match the constraints
-        if len(self._lru) > self.max_size:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-        while self._n_bytes > self.max_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-
-    def trim_to(
-        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
-    ):
-        n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
-        n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
-
-        while len(self._lru) > n_sequences:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-        while self._n_bytes > n_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes

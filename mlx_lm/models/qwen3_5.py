@@ -8,11 +8,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_map
 
-from .base import (
-    BaseModelArgs,
-    create_attention_mask,
-    create_ssm_mask,
-)
+from .base import BaseModelArgs, create_attention_mask, create_ssm_mask
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .qwen3_next import Qwen3NextAttention as Attention
@@ -50,7 +46,6 @@ class TextModelArgs(BaseModelArgs):
     moe_intermediate_size: int = 0
     norm_topk_prob: bool = True
 
-    # Rope parameters
     rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
         default_factory=lambda: {
             "type": "default",
@@ -60,7 +55,6 @@ class TextModelArgs(BaseModelArgs):
         }
     )
 
-    # Derived from rope_parameters (set in __post_init__)
     partial_rotary_factor: float = 0.25
     rope_theta: float = 100000.0
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
@@ -316,7 +310,7 @@ class TextModel(nn.Module):
             ".q_norm.weight",
             ".k_norm.weight",
         )
-        for k, v in weights.items():
+        for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
             if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
@@ -380,52 +374,43 @@ class Model(nn.Module):
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
                 continue
-            if key.startswith("model.visual"):
-                continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")
-            elif key.startswith("language_model."):
-                pass
-            else:
+            elif not key.startswith("language_model."):
                 key = "language_model." + key
             sanitized[key] = value
         return self.language_model.sanitize(sanitized)
 
     def shard(self, group=None):
         group = group or mx.distributed.init()
-        N = group.size()
+        num_shards = group.size()
         rank = group.rank()
 
-        # A sharding factory for the convolution in gated delta net
         def conv_sharding(key_dim):
             return lambda p, w: (0, [key_dim, 2 * key_dim])
 
-        def repeat_kv_layer_inplace(layer, h):
-            # No repeat needed cause we have more heads than nodes
-            if N <= h:
+        def repeat_kv_layer_inplace(layer, num_heads):
+            if num_shards <= num_heads:
                 return
 
-            # Repeat function to apply to the layer weights
-            def _repeat(p):
-                s = p.shape
-                p = p.reshape(h, s[0] // h, *s[1:])
-                p = mx.repeat(p, N // h, axis=0)
-                p = p.reshape(-1, *s[1:])
-                return p
+            def _repeat(params):
+                shape = params.shape
+                params = params.reshape(num_heads, shape[0] // num_heads, *shape[1:])
+                params = mx.repeat(params, num_shards // num_heads, axis=0)
+                return params.reshape(-1, *shape[1:])
 
             layer.update(tree_map(_repeat, layer.parameters()))
 
         for layer in self.layers:
-            # Linear attention
             if layer.is_linear:
-                kd = layer.linear_attn.key_dim
+                key_dim = layer.linear_attn.key_dim
                 layer.linear_attn.sharding_group = group
-                shard_inplace(layer.linear_attn.conv1d, conv_sharding(kd), group=group)
-                layer.linear_attn.conv1d.groups //= N
+                shard_inplace(layer.linear_attn.conv1d, conv_sharding(key_dim), group=group)
+                layer.linear_attn.conv1d.groups //= num_shards
                 shard_inplace(
                     layer.linear_attn.in_proj_qkv,
                     "all-to-sharded",
-                    segments=[kd, 2 * kd],
+                    segments=[key_dim, 2 * key_dim],
                     group=group,
                 )
                 shard_inplace(
@@ -438,19 +423,17 @@ class Model(nn.Module):
                     layer.linear_attn.in_proj_a, "all-to-sharded", group=group
                 )
                 layer.linear_attn.dt_bias = mx.contiguous(
-                    mx.split(layer.linear_attn.dt_bias, N)[rank]
+                    mx.split(layer.linear_attn.dt_bias, num_shards)[rank]
                 )
                 layer.linear_attn.A_log = mx.contiguous(
-                    mx.split(layer.linear_attn.A_log, N)[rank]
+                    mx.split(layer.linear_attn.A_log, num_shards)[rank]
                 )
                 shard_inplace(layer.linear_attn.out_proj, "sharded-to-all", group=group)
-                layer.linear_attn.num_k_heads //= N
-                layer.linear_attn.num_v_heads //= N
-                layer.linear_attn.key_dim //= N
-                layer.linear_attn.value_dim //= N
-                layer.linear_attn.conv_dim //= N
-
-            # Softmax attention
+                layer.linear_attn.num_k_heads //= num_shards
+                layer.linear_attn.num_v_heads //= num_shards
+                layer.linear_attn.key_dim //= num_shards
+                layer.linear_attn.value_dim //= num_shards
+                layer.linear_attn.conv_dim //= num_shards
             else:
                 layer.self_attn.o_proj = shard_linear(
                     layer.self_attn.o_proj, "sharded-to-all", group=group
@@ -470,12 +453,11 @@ class Model(nn.Module):
                 layer.self_attn.v_proj = shard_linear(
                     layer.self_attn.v_proj, "all-to-sharded", group=group
                 )
-                layer.self_attn.num_attention_heads //= N
+                layer.self_attn.num_attention_heads //= num_shards
                 layer.self_attn.num_key_value_heads = max(
-                    1, layer.self_attn.num_key_value_heads // N
+                    1, layer.self_attn.num_key_value_heads // num_shards
                 )
 
-            # MLP
             if isinstance(layer.mlp, MLP):
                 layer.mlp.gate_proj = shard_linear(
                     layer.mlp.gate_proj, "all-to-sharded", group=group
@@ -486,8 +468,6 @@ class Model(nn.Module):
                 layer.mlp.up_proj = shard_linear(
                     layer.mlp.up_proj, "all-to-sharded", group=group
                 )
-
-            # MoE
             else:
                 layer.mlp.sharding_group = group
                 shard_inplace(

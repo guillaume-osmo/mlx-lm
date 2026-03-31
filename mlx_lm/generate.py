@@ -204,6 +204,136 @@ def setup_arg_parser():
         default=DEFAULT_QUANTIZED_KV_START,
     )
     parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prefill processing.",
+    )
+    parser.add_argument(
+        "--quantized-kv-fp16-layers",
+        type=int,
+        default=0,
+        help="When --kv-bits is set, keep this many first/last layers in their "
+        "default FP16 cache form and quantize the middle layers only.",
+    )
+    parser.add_argument(
+        "--turbo-kv-bits",
+        type=float,
+        help="[Experimental] Number of bits for TurboQuant KV cache "
+        "compression (2-4, fractional values like 2.5/3.5 supported). "
+        "Uses PolarQuant for data-oblivious compression. Default: no "
+        "TurboQuant compression.",
+        default=None,
+    )
+    parser.add_argument(
+        "--turbo-key-bits",
+        type=int,
+        default=None,
+        help="[Experimental] Optional integer bit-width override for TurboQuant keys.",
+    )
+    parser.add_argument(
+        "--turbo-value-bits",
+        type=int,
+        default=None,
+        help="[Experimental] Optional integer bit-width override for TurboQuant values.",
+    )
+    parser.add_argument(
+        "--turbo-fp16-layers",
+        type=int,
+        default=1,
+        help="[Experimental] Number of first/last layers to keep in their "
+        "default cache form when using --turbo-kv-bits.",
+    )
+    parser.add_argument(
+        "--turbo-fp16-layer-indices",
+        type=int,
+        nargs="*",
+        default=None,
+        help="[Experimental] Absolute layer indices to keep in FP16 when using "
+        "--turbo-kv-bits. Overrides --turbo-fp16-layers when provided.",
+    )
+    parser.add_argument(
+        "--turbo-rotation-mode",
+        type=str,
+        choices=["dense", "wht", "rotor3", "rotorquant"],
+        default="dense",
+        help="[Experimental] TurboQuant rotation mode.",
+    )
+    parser.add_argument(
+        "--turbo-estimator-mode",
+        type=str,
+        choices=["mse", "prod"],
+        default="mse",
+        help="[Experimental] TurboQuant estimator mode. "
+        "'prod' uses a paper-faithful 1-bit QJL residual correction on keys.",
+    )
+    parser.add_argument(
+        "--turbo-qjl-projection-mode",
+        type=str,
+        choices=["auto", "dense", "wht"],
+        default="auto",
+        help="[Experimental] TurboQuant QJL projection backend for 'prod' mode.",
+    )
+    parser.add_argument(
+        "--turbo-disable-qjl",
+        action="store_true",
+        help="[Experimental] Disable the 1-bit QJL residual correction in TurboQuant prod mode.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-tau",
+        type=float,
+        default=None,
+        help="[Experimental] Optional sparse-V attention threshold for TurboQuant fused decode.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-mode",
+        type=str,
+        choices=["fixed", "percentile", "adaptive"],
+        default=None,
+        help="[Experimental] Sparse-V policy for TurboQuant fused decode.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-percentile",
+        type=float,
+        default=None,
+        help="[Experimental] Skip the bottom N%% of attention weights in sparse-V percentile/adaptive modes.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-early-multiplier",
+        type=float,
+        default=1.25,
+        help="[Experimental] Adaptive sparse-V multiplier for the first layer.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-late-multiplier",
+        type=float,
+        default=0.75,
+        help="[Experimental] Adaptive sparse-V multiplier for the last layer.",
+    )
+    parser.add_argument(
+        "--turbo-decode-buffer",
+        action="store_true",
+        help="[Experimental] Use an incremental dequantized K/V decode buffer for TurboQuant.",
+    )
+    parser.add_argument(
+        "--turbo-buffer-size",
+        type=int,
+        default=0,
+        help="[Experimental] Keep this many recent TurboQuant tokens in FP16 and merge them with compressed history during decode.",
+    )
+    parser.add_argument(
+        "--turbo-flush-batch-size",
+        type=int,
+        default=0,
+        help="[Experimental] Compress overflowed TurboQuant buffer tokens in batches of this size.",
+    )
+    parser.add_argument(
+        "--turbo-max-kv-size",
+        type=int,
+        default=0,
+        help="[Experimental] Keep at most this many TurboQuant tokens by evicting the oldest compressed tokens.",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -220,6 +350,16 @@ def setup_arg_parser():
 
 # A stream on the default device just for generation
 generation_stream = mx.new_stream(mx.default_device())
+
+
+def _metal_device_info():
+    if not mx.metal.is_available():
+        return None
+    if hasattr(mx, "device_info"):
+        return mx.device_info()
+    if hasattr(mx.metal, "device_info"):
+        return mx.metal.device_info()
+    return None
 
 
 @contextlib.contextmanager
@@ -240,7 +380,8 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         model_bytes = tree_reduce(
             lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
         )
-        max_rec_size = mx.device_info()["max_recommended_working_set_size"]
+        device_info = _metal_device_info()
+        max_rec_size = device_info["max_recommended_working_set_size"]
         if model_bytes > 0.9 * max_rec_size:
             model_mb = model_bytes // 2**20
             max_rec_mb = max_rec_size // 2**20
@@ -292,12 +433,68 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
-def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
+def maybe_quantize_kv_cache(
+    prompt_cache,
+    quantized_kv_start,
+    kv_group_size,
+    kv_bits,
+    quantized_kv_fp16_layers: int = 0,
+):
     if kv_bits is None:
         return
+    num_layers = len(prompt_cache)
     for e, c in enumerate(prompt_cache):
+        if (
+            quantized_kv_fp16_layers > 0
+            and (e < quantized_kv_fp16_layers or e >= num_layers - quantized_kv_fp16_layers)
+        ):
+            continue
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+
+
+def maybe_turboquant_kv_cache(
+    prompt_cache,
+    turbo_kv_bits,
+    turbo_key_bits: Optional[int] = None,
+    turbo_value_bits: Optional[int] = None,
+    turbo_rotation_mode: str = "dense",
+    turbo_estimator_mode: str = "mse",
+    turbo_qjl_residual: bool = True,
+    turbo_qjl_projection_mode: str = "auto",
+    turbo_sparse_v_tau: Optional[float] = None,
+    turbo_sparse_v_mode: Optional[str] = None,
+    turbo_sparse_v_percentile: Optional[float] = None,
+    turbo_sparse_v_early_multiplier: float = 1.25,
+    turbo_sparse_v_late_multiplier: float = 0.75,
+    turbo_decode_buffer: bool = False,
+    turbo_buffer_size: int = 0,
+    turbo_flush_batch_size: int = 0,
+    turbo_max_kv_size: int = 0,
+):
+    """Convert KV caches to TurboQuant compression (experimental)."""
+    if turbo_kv_bits is None:
+        return
+    for e, c in enumerate(prompt_cache):
+        if hasattr(c, "to_turboquant") and not hasattr(c, "turbo_bits"):
+            prompt_cache[e] = c.to_turboquant(
+                bits=turbo_kv_bits,
+                key_bits=turbo_key_bits,
+                value_bits=turbo_value_bits,
+                rotation_mode=turbo_rotation_mode,
+                estimator_mode=turbo_estimator_mode,
+                qjl_residual=turbo_qjl_residual,
+                qjl_projection_mode=turbo_qjl_projection_mode,
+                sparse_v_tau=turbo_sparse_v_tau,
+                sparse_v_mode=turbo_sparse_v_mode,
+                sparse_v_percentile=turbo_sparse_v_percentile,
+                sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+                sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
+                decode_buffer=turbo_decode_buffer,
+                buffer_size=turbo_buffer_size,
+                flush_batch_size=turbo_flush_batch_size,
+                max_cache_tokens=turbo_max_kv_size,
+            )
 
 
 def generate_step(
@@ -313,6 +510,25 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    quantized_kv_fp16_layers: int = 0,
+    turbo_kv_bits: Optional[float] = None,
+    turbo_key_bits: Optional[int] = None,
+    turbo_value_bits: Optional[int] = None,
+    turbo_fp16_layers: int = 1,
+    turbo_fp16_layer_indices: Optional[List[int]] = None,
+    turbo_rotation_mode: str = "dense",
+    turbo_estimator_mode: str = "mse",
+    turbo_qjl_residual: bool = True,
+    turbo_qjl_projection_mode: str = "auto",
+    turbo_sparse_v_tau: Optional[float] = None,
+    turbo_sparse_v_mode: Optional[str] = None,
+    turbo_sparse_v_percentile: Optional[float] = None,
+    turbo_sparse_v_early_multiplier: float = 1.25,
+    turbo_sparse_v_late_multiplier: float = 0.75,
+    turbo_decode_buffer: bool = False,
+    turbo_buffer_size: int = 0,
+    turbo_flush_batch_size: int = 0,
+    turbo_max_kv_size: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -339,6 +555,51 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        quantized_kv_fp16_layers (int): Number of first/last layers to keep in
+          their default cache form when using standard MLX quantized KV cache.
+          Default: ``0``.
+        turbo_kv_bits (float, optional): Number of bits for TurboQuant KV cache
+          compression (2-4). Fractional values such as ``2.5`` and ``3.5``
+          split the head dimension across neighboring integer bit-widths.
+          Uses PolarQuant for data-oblivious compression.
+          None implies no TurboQuant compression. Default: ``None``.
+        turbo_key_bits (int, optional): Optional integer TurboQuant key bit-width
+          override. Default: ``None``.
+        turbo_value_bits (int, optional): Optional integer TurboQuant value
+          bit-width override. Default: ``None``.
+        turbo_fp16_layers (int): Number of first/last layers to keep in their
+          default cache form when using TurboQuant. Default: ``1``.
+        turbo_fp16_layer_indices (List[int], optional): Absolute layer indices
+          to keep in their default cache form when using TurboQuant. If
+          provided, overrides ``turbo_fp16_layers``.
+        turbo_rotation_mode (str): TurboQuant rotation mode, ``dense``, ``rotor3``,
+          or ``rotorquant``.
+          Default: ``dense``.
+        turbo_estimator_mode (str): TurboQuant estimator mode, ``mse`` or
+          ``prod``. ``prod`` uses ``bits - 1`` MSE bits plus a 1-bit QJL
+          residual correction for keys. Default: ``mse``.
+        turbo_qjl_residual (bool): Keep the 1-bit QJL residual correction for
+          keys in TurboQuant ``prod`` mode. Default: ``True``.
+        turbo_qjl_projection_mode (str): QJL projection backend for TurboQuant
+          ``prod`` mode: ``auto``, ``dense``, or ``wht``. Default: ``auto``.
+        turbo_sparse_v_tau (float, optional): Optional sparse-V threshold applied
+          in fused TurboQuant decode attention. Default: ``None``.
+        turbo_sparse_v_mode (str, optional): Sparse-V policy: ``fixed``,
+          ``percentile``, or ``adaptive``. Default: ``None``.
+        turbo_sparse_v_percentile (float, optional): Bottom percentage of
+          attention weights to skip in sparse-V percentile/adaptive modes.
+        turbo_sparse_v_early_multiplier (float): Adaptive sparse-V multiplier
+          for the first layer. Default: ``1.25``.
+        turbo_sparse_v_late_multiplier (float): Adaptive sparse-V multiplier
+          for the last layer. Default: ``0.75``.
+        turbo_decode_buffer (bool): Keep a running dequantized K/V buffer and
+          only materialize new tokens on decode. Default: ``False``.
+        turbo_buffer_size (int): Keep this many recent TurboQuant tokens in
+          FP16 and merge them with compressed history during decode.
+        turbo_flush_batch_size (int): Compress buffered overflow in batches
+          of this size.
+        turbo_max_kv_size (int): Keep at most this many TurboQuant tokens by
+          evicting the oldest compressed tokens.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
@@ -368,6 +629,24 @@ def generate_step(
         prompt_cache = cache.make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
+            turbo_kv_bits=turbo_kv_bits,
+            turbo_key_bits=turbo_key_bits,
+            turbo_value_bits=turbo_value_bits,
+            turbo_fp16_layers=turbo_fp16_layers,
+            turbo_fp16_layer_indices=turbo_fp16_layer_indices,
+            turbo_rotation_mode=turbo_rotation_mode,
+            turbo_estimator_mode=turbo_estimator_mode,
+            turbo_qjl_residual=turbo_qjl_residual,
+            turbo_qjl_projection_mode=turbo_qjl_projection_mode,
+            turbo_sparse_v_tau=turbo_sparse_v_tau,
+            turbo_sparse_v_mode=turbo_sparse_v_mode,
+            turbo_sparse_v_percentile=turbo_sparse_v_percentile,
+            turbo_sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+            turbo_sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
+            turbo_decode_buffer=turbo_decode_buffer,
+            turbo_buffer_size=turbo_buffer_size,
+            turbo_flush_batch_size=turbo_flush_batch_size,
+            turbo_max_kv_size=turbo_max_kv_size,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -377,6 +656,27 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        quantized_kv_fp16_layers=quantized_kv_fp16_layers,
+    )
+
+    turboquant_cache_fn = functools.partial(
+        maybe_turboquant_kv_cache,
+        turbo_kv_bits=turbo_kv_bits,
+        turbo_key_bits=turbo_key_bits,
+        turbo_value_bits=turbo_value_bits,
+        turbo_rotation_mode=turbo_rotation_mode,
+        turbo_estimator_mode=turbo_estimator_mode,
+        turbo_qjl_residual=turbo_qjl_residual,
+        turbo_qjl_projection_mode=turbo_qjl_projection_mode,
+        turbo_sparse_v_tau=turbo_sparse_v_tau,
+        turbo_sparse_v_mode=turbo_sparse_v_mode,
+        turbo_sparse_v_percentile=turbo_sparse_v_percentile,
+        turbo_sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+        turbo_sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
+        turbo_decode_buffer=turbo_decode_buffer,
+        turbo_buffer_size=turbo_buffer_size,
+        turbo_flush_batch_size=turbo_flush_batch_size,
+        turbo_max_kv_size=turbo_max_kv_size,
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -412,6 +712,7 @@ def generate_step(
                     logits = processor(tokens, logits)
 
             quantize_cache_fn(prompt_cache)
+            turboquant_cache_fn(prompt_cache)
 
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             sampled = sampler(logprobs)
@@ -435,6 +736,7 @@ def generate_step(
                 ),
             )
             quantize_cache_fn(prompt_cache)
+            turboquant_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
@@ -480,6 +782,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    quantized_kv_fp16_layers: int = 0,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -505,6 +808,9 @@ def speculative_generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        quantized_kv_fp16_layers (int): Number of first/last layers to keep in
+          their default cache form when using standard MLX quantized KV cache.
+          Default: ``0``.
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
@@ -529,6 +835,7 @@ def speculative_generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        quantized_kv_fp16_layers=quantized_kv_fp16_layers,
     )
 
     def _process_and_sample(tokens, logits):
@@ -980,8 +1287,9 @@ class BatchGenerator:
         self.active_batch = None
 
         if mx.metal.is_available():
+            device_info = _metal_device_info()
             self._old_wired_limit = mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
+                device_info["max_recommended_working_set_size"]
             )
         else:
             self._old_wired_limit = None
@@ -1422,12 +1730,14 @@ def main():
             args.prompt_cache_file,
             return_metadata=True,
         )
-        if isinstance(prompt_cache[0], QuantizedKVCache):
-            if args.kv_bits is not None and args.kv_bits != prompt_cache[0].bits:
+        quantized_layers = [c for c in prompt_cache if isinstance(c, QuantizedKVCache)]
+        if quantized_layers:
+            quantized_cache = quantized_layers[0]
+            if args.kv_bits is not None and args.kv_bits != quantized_cache.bits:
                 raise ValueError(
                     "--kv-bits does not match the kv cache loaded from --prompt-cache-file."
                 )
-            if args.kv_group_size != prompt_cache[0].group_size:
+            if args.kv_group_size != quantized_cache.group_size:
                 raise ValueError(
                     "--kv-group-size does not match the kv cache loaded from --prompt-cache-file."
                 )
@@ -1523,9 +1833,29 @@ def main():
         sampler=sampler,
         max_kv_size=args.max_kv_size,
         prompt_cache=prompt_cache if using_cache else None,
+        prefill_step_size=args.prefill_step_size,
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        quantized_kv_fp16_layers=args.quantized_kv_fp16_layers,
+        turbo_kv_bits=args.turbo_kv_bits,
+        turbo_key_bits=args.turbo_key_bits,
+        turbo_value_bits=args.turbo_value_bits,
+        turbo_fp16_layers=args.turbo_fp16_layers,
+        turbo_fp16_layer_indices=args.turbo_fp16_layer_indices,
+        turbo_rotation_mode=args.turbo_rotation_mode,
+        turbo_estimator_mode=args.turbo_estimator_mode,
+        turbo_qjl_residual=not args.turbo_disable_qjl,
+        turbo_qjl_projection_mode=args.turbo_qjl_projection_mode,
+        turbo_sparse_v_tau=args.turbo_sparse_v_tau,
+        turbo_sparse_v_mode=args.turbo_sparse_v_mode,
+        turbo_sparse_v_percentile=args.turbo_sparse_v_percentile,
+        turbo_sparse_v_early_multiplier=args.turbo_sparse_v_early_multiplier,
+        turbo_sparse_v_late_multiplier=args.turbo_sparse_v_late_multiplier,
+        turbo_decode_buffer=args.turbo_decode_buffer,
+        turbo_buffer_size=args.turbo_buffer_size,
+        turbo_flush_batch_size=args.turbo_flush_batch_size,
+        turbo_max_kv_size=args.turbo_max_kv_size,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
