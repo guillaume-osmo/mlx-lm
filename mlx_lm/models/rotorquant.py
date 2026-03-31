@@ -865,6 +865,13 @@ class RotorQuantKVCache(_BaseCache):
     def size(self):
         return self.offset
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        obj.meta_state = meta_state
+        obj.state = state
+        return obj
+
     @property
     def state(self):
         self._ensure_runtime_attrs()

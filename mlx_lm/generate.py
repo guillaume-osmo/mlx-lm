@@ -204,6 +204,12 @@ def setup_arg_parser():
         default=DEFAULT_QUANTIZED_KV_START,
     )
     parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prefill processing.",
+    )
+    parser.add_argument(
         "--quantized-kv-fp16-layers",
         type=int,
         default=0,
@@ -1827,6 +1833,7 @@ def main():
         sampler=sampler,
         max_kv_size=args.max_kv_size,
         prompt_cache=prompt_cache if using_cache else None,
+        prefill_step_size=args.prefill_step_size,
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,

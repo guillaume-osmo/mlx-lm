@@ -893,12 +893,18 @@ class TurboQuantKVCache(_BaseCache):
         )
 
     def _ensure_runtime_attrs(self):
+        if not hasattr(self, "turbo_bits"):
+            self.turbo_bits = 4
         if not hasattr(self, "_fractional_split"):
             self._fractional_split = False
         if not hasattr(self, "key_bits_override"):
             self.key_bits_override = None
         if not hasattr(self, "value_bits_override"):
             self.value_bits_override = None
+        if not hasattr(self, "rotation_mode"):
+            self.rotation_mode = "dense"
+        if not hasattr(self, "estimator_mode"):
+            self.estimator_mode = "mse"
         if not hasattr(self, "qjl_residual"):
             self.qjl_residual = True
         if not hasattr(self, "_split_low_bits"):
@@ -2008,6 +2014,23 @@ class TurboQuantKVCache(_BaseCache):
 
     def size(self):
         return self.offset
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        # Seed the minimal config needed for state restoration before
+        # meta_state has replayed the serialized settings. Fractional
+        # split caches require state to be restored first so meta_state
+        # can consume the pending split payload.
+        obj.turbo_bits = 4
+        obj.key_bits_override = None
+        obj.value_bits_override = None
+        obj.rotation_mode = "dense"
+        obj.estimator_mode = "mse"
+        obj.qjl_residual = True
+        obj.state = state
+        obj.meta_state = meta_state
+        return obj
 
     @property
     def state(self):

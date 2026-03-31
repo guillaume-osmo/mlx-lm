@@ -1,12 +1,13 @@
 # Copyright © 2025 Apple Inc.
 
 import argparse
+import time
 
 import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
-from mlx_lm.utils import pipeline_load
+from mlx_lm.utils import sharded_load
 
 
 def setup_arg_parser():
@@ -48,6 +49,29 @@ def setup_arg_parser():
         default=5,
         help="Number of timing trials",
         type=int,
+    )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Quantize activations using the same quantization config as the corresponding layer.",
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=0,
+        help="Delay between each test in seconds (default: 0)",
     )
     parser.add_argument(
         "--kv-bits",
@@ -194,6 +218,8 @@ def main():
 
     group = mx.distributed.init()
     rank = group.rank()
+    pipeline_group = group if args.pipeline else None
+    tensor_group = group if not args.pipeline else None
 
     def rprint(*args, **kwargs):
         if rank == 0:
@@ -202,10 +228,15 @@ def main():
     model_path = args.model or DEFAULT_MODEL
 
     if group.size() > 1:
-        model, tokenizer, config = pipeline_load(args.model, return_config=True)
+        model, tokenizer, config = sharded_load(
+            model_path, pipeline_group, tensor_group, return_config=True
+        )
     else:
         model, tokenizer, config = load(
-            args.model, return_config=True, tokenizer_config={"trust_remote_code": True}
+            model_path,
+            return_config=True,
+            tokenizer_config={"trust_remote_code": True},
+            model_config={"quantize_activations": args.quantize_activations},
         )
 
     # Empty to avoid early stopping
@@ -224,6 +255,7 @@ def main():
             tokenizer,
             prompt,
             max_tokens=generation_tokens,
+            prefill_step_size=args.prefill_step_size,
             kv_bits=args.kv_bits,
             kv_group_size=args.kv_group_size,
             quantized_kv_start=args.quantized_kv_start,
@@ -256,6 +288,7 @@ def main():
             tokenizer,
             prompts,
             max_tokens=generation_tokens,
+            prefill_step_size=args.prefill_step_size,
             kv_bits=args.kv_bits,
             kv_group_size=args.kv_group_size,
             quantized_kv_start=args.quantized_kv_start,
@@ -281,6 +314,8 @@ def main():
     rprint(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
     for i in range(args.num_trials):
+        if args.delay > 0:
+            time.sleep(args.delay)
         response = _bench()
         responses.append(response)
         results = [(k, getattr(response, k)) for k in report_keys]
