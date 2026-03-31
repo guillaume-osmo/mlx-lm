@@ -98,6 +98,13 @@ def setup_arg_parser():
         help="[Experimental] Number of first/last layers to keep in their default cache form when using TurboQuant.",
     )
     parser.add_argument(
+        "--turbo-fp16-layer-indices",
+        type=int,
+        nargs="*",
+        default=None,
+        help="[Experimental] Absolute layer indices to keep in FP16 when using TurboQuant. Overrides --turbo-fp16-layers when provided.",
+    )
+    parser.add_argument(
         "--turbo-rotation-mode",
         type=str,
         choices=["dense", "rotor3", "rotorquant"],
@@ -225,6 +232,7 @@ def main():
             turbo_key_bits=args.turbo_key_bits,
             turbo_value_bits=args.turbo_value_bits,
             turbo_fp16_layers=args.turbo_fp16_layers,
+            turbo_fp16_layer_indices=args.turbo_fp16_layer_indices,
             turbo_rotation_mode=args.turbo_rotation_mode,
             turbo_estimator_mode=args.turbo_estimator_mode,
             turbo_qjl_residual=not args.turbo_disable_qjl,

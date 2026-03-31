@@ -980,6 +980,22 @@ class TestPromptCache(unittest.TestCase):
             self.assertIsInstance(c, TurboQuantKVCache)
             self.assertEqual(c.turbo_bits, 3)
 
+    def test_make_prompt_cache_turboquant_explicit_fp16_indices_override_edges(self):
+        """Explicit FP16 layer indices should override first/last edge routing."""
+        model = DummyCacheModel([KVCache() for _ in range(6)])
+
+        prompt_cache = make_prompt_cache(
+            model,
+            turbo_kv_bits=3,
+            turbo_fp16_layers=1,
+            turbo_fp16_layer_indices=[2, 4],
+        )
+
+        for i in [2, 4]:
+            self.assertIsInstance(prompt_cache[i], KVCache)
+        for i in [0, 1, 3, 5]:
+            self.assertIsInstance(prompt_cache[i], TurboQuantKVCache)
+
     def test_make_prompt_cache_turboquant_preserves_mixed_caches(self):
         """Test non-KV cache entries survive TurboQuant routing unchanged."""
         model = DummyCacheModel(

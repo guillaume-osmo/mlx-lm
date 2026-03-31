@@ -239,6 +239,14 @@ def setup_arg_parser():
         "default cache form when using --turbo-kv-bits.",
     )
     parser.add_argument(
+        "--turbo-fp16-layer-indices",
+        type=int,
+        nargs="*",
+        default=None,
+        help="[Experimental] Absolute layer indices to keep in FP16 when using "
+        "--turbo-kv-bits. Overrides --turbo-fp16-layers when provided.",
+    )
+    parser.add_argument(
         "--turbo-rotation-mode",
         type=str,
         choices=["dense", "rotor3", "rotorquant"],
@@ -501,6 +509,7 @@ def generate_step(
     turbo_key_bits: Optional[int] = None,
     turbo_value_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
+    turbo_fp16_layer_indices: Optional[List[int]] = None,
     turbo_rotation_mode: str = "dense",
     turbo_estimator_mode: str = "mse",
     turbo_qjl_residual: bool = True,
@@ -554,6 +563,9 @@ def generate_step(
           bit-width override. Default: ``None``.
         turbo_fp16_layers (int): Number of first/last layers to keep in their
           default cache form when using TurboQuant. Default: ``1``.
+        turbo_fp16_layer_indices (List[int], optional): Absolute layer indices
+          to keep in their default cache form when using TurboQuant. If
+          provided, overrides ``turbo_fp16_layers``.
         turbo_rotation_mode (str): TurboQuant rotation mode, ``dense``, ``rotor3``,
           or ``rotorquant``.
           Default: ``dense``.
@@ -615,6 +627,7 @@ def generate_step(
             turbo_key_bits=turbo_key_bits,
             turbo_value_bits=turbo_value_bits,
             turbo_fp16_layers=turbo_fp16_layers,
+            turbo_fp16_layer_indices=turbo_fp16_layer_indices,
             turbo_rotation_mode=turbo_rotation_mode,
             turbo_estimator_mode=turbo_estimator_mode,
             turbo_qjl_residual=turbo_qjl_residual,
@@ -1822,6 +1835,7 @@ def main():
         turbo_key_bits=args.turbo_key_bits,
         turbo_value_bits=args.turbo_value_bits,
         turbo_fp16_layers=args.turbo_fp16_layers,
+        turbo_fp16_layer_indices=args.turbo_fp16_layer_indices,
         turbo_rotation_mode=args.turbo_rotation_mode,
         turbo_estimator_mode=args.turbo_estimator_mode,
         turbo_qjl_residual=not args.turbo_disable_qjl,

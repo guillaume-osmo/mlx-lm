@@ -17,6 +17,7 @@ def make_prompt_cache(
     turbo_key_bits: Optional[int] = None,
     turbo_value_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
+    turbo_fp16_layer_indices: Optional[List[int]] = None,
     turbo_rotation_mode: str = "dense",
     turbo_estimator_mode: str = "mse",
     turbo_qjl_residual: bool = True,
@@ -57,6 +58,9 @@ def make_prompt_cache(
             for TurboQuant values.
         turbo_fp16_layers (int): Number of first/last layers to keep in their
             default cache form when using TurboQuant.
+        turbo_fp16_layer_indices (Optional[List[int]]): Absolute layer indices
+            to keep in their default cache form when using TurboQuant. If
+            provided, this overrides ``turbo_fp16_layers``.
         turbo_rotation_mode (str): TurboQuant rotation mode.
         turbo_estimator_mode (str): TurboQuant estimator mode.
         turbo_qjl_residual (bool): Enable the 1-bit QJL residual correction on
@@ -152,10 +156,21 @@ def make_prompt_cache(
         fp16_layers = (
             turbo_fp16_layers if turbo_kv_bits is not None else rotor_fp16_layers
         )
+        fp16_index_set = (
+            {int(i) for i in turbo_fp16_layer_indices}
+            if turbo_kv_bits is not None and turbo_fp16_layer_indices is not None
+            else None
+        )
         to_backend = _to_turboquant if turbo_kv_bits is not None else _to_rotorquant
         return _annotate_layers([
             c
-            if i < fp16_layers or i >= num_layers - fp16_layers
+            if (
+                (fp16_index_set is not None and i in fp16_index_set)
+                or (
+                    fp16_index_set is None
+                    and (i < fp16_layers or i >= num_layers - fp16_layers)
+                )
+            )
             else to_backend(c)
             for i, c in enumerate(default_cache)
         ])
@@ -168,27 +183,43 @@ def make_prompt_cache(
                 "--max-kv-size on models without make_cache()."
             )
         if turbo_kv_bits is not None:
-            return _annotate_layers([
-                KVCache().to_turboquant(
-                    bits=turbo_kv_bits,
-                    key_bits=turbo_key_bits,
-                    value_bits=turbo_value_bits,
-                    rotation_mode=turbo_rotation_mode,
-                    estimator_mode=turbo_estimator_mode,
-                    qjl_residual=turbo_qjl_residual,
-                    sparse_v_tau=turbo_sparse_v_tau,
-                    sparse_v_mode=turbo_sparse_v_mode,
-                    sparse_v_percentile=turbo_sparse_v_percentile,
-                    sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
-                    sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
-                    qjl_projection_mode=turbo_qjl_projection_mode,
-                    decode_buffer=turbo_decode_buffer,
-                    buffer_size=turbo_buffer_size,
-                    flush_batch_size=turbo_flush_batch_size,
-                    max_cache_tokens=turbo_max_kv_size,
-                )
-                for _ in range(num_layers)
-            ])
+            fp16_index_set = (
+                {int(i) for i in turbo_fp16_layer_indices}
+                if turbo_fp16_layer_indices is not None
+                else None
+            )
+            caches = []
+            for i in range(num_layers):
+                if (
+                    (fp16_index_set is not None and i in fp16_index_set)
+                    or (
+                        fp16_index_set is None
+                        and (i < turbo_fp16_layers or i >= num_layers - turbo_fp16_layers)
+                    )
+                ):
+                    caches.append(KVCache())
+                else:
+                    caches.append(
+                        KVCache().to_turboquant(
+                            bits=turbo_kv_bits,
+                            key_bits=turbo_key_bits,
+                            value_bits=turbo_value_bits,
+                            rotation_mode=turbo_rotation_mode,
+                            estimator_mode=turbo_estimator_mode,
+                            qjl_residual=turbo_qjl_residual,
+                            sparse_v_tau=turbo_sparse_v_tau,
+                            sparse_v_mode=turbo_sparse_v_mode,
+                            sparse_v_percentile=turbo_sparse_v_percentile,
+                            sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+                            sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
+                            qjl_projection_mode=turbo_qjl_projection_mode,
+                            decode_buffer=turbo_decode_buffer,
+                            buffer_size=turbo_buffer_size,
+                            flush_batch_size=turbo_flush_batch_size,
+                            max_cache_tokens=turbo_max_kv_size,
+                        )
+                    )
+            return _annotate_layers(caches)
         return [
             KVCache().to_rotorquant(
                 bits=rotor_kv_bits,
