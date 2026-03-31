@@ -186,6 +186,30 @@ def _matmul_buffer_values(probs, values):
         )
     return probs @ values
 
+
+def _fast_scaled_dot_product_attention(queries, keys, values, *, scale, mask, sinks=None):
+    kwargs = dict(scale=scale, mask=mask)
+    if sinks is not None:
+        try:
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                sinks=sinks,
+                **kwargs,
+            )
+        except TypeError as e:
+            raise TypeError(
+                "This MLX runtime does not support attention sinks in "
+                "mx.fast.scaled_dot_product_attention()."
+            ) from e
+    return mx.fast.scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        **kwargs,
+    )
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -224,7 +248,7 @@ def scaled_dot_product_attention(
         ):
             full_keys = cache._dequantize_keys(dtype=queries.dtype)
             full_values = cache._dequantize_values(dtype=values.dtype if values is not None else queries.dtype)
-            return mx.fast.scaled_dot_product_attention(
+            return _fast_scaled_dot_product_attention(
                 queries,
                 full_keys,
                 full_values,
@@ -289,7 +313,7 @@ def scaled_dot_product_attention(
             bits=cache.bits,
         )
 
-    return mx.fast.scaled_dot_product_attention(
+    return _fast_scaled_dot_product_attention(
         queries,
         keys,
         values,

@@ -337,6 +337,40 @@ Current local evidence:
 If you care about exactness, benchmark `prod` both **with** and **without**
 QJL on the target model before deciding.
 
+#### Upstream Inputs We Actually Used
+
+This branch is informed by several public experiments, but not all of their
+claims transferred directly:
+
+| Source | What mattered here | What did **not** transfer automatically |
+| --- | --- | --- |
+| `yzamari/mlx-fork` | native MLX fused TurboQuant runtime ideas, including the `mx.fast.turboquant_attention` family and the surrounding Metal integration | public benchmark ratios in README/docs were **not** used as truth without local reproduction |
+| `yzamari/mlx-turboquant` / `turboQuantPlayground` | recent-buffer decode, batch-flush / prefill-bypass ideas, MLX long-context experimentation | the public `yza_fused` profile was too lossy on our Qwen3.5 long-context exact-match runs |
+| `tonbistudio/turboquant-pytorch` | strong separation between attention-score validation and **real text generation** validation; useful ablations around QJL and long context | PyTorch / CUDA speed claims do not say much by themselves about MLX runtime behavior |
+| `DeadByDawn101/turboquant-mlx` | a useful reminder that an implementation can have correct math on paper while still missing the live QJL wiring or compressed-domain attention kernel | README-level “implementation status” honesty is not a performance result |
+| `scrya-com/rotorquant` and `kpalastro/mlx_rotorquant` | rotor / fewer-parameter rotation design space, fused-kernel motivation, and why microkernel speed is worth chasing | RotorQuant has **not** yet replaced the exact TurboQuant winners on this branch |
+
+The practical rule we use in this repo is:
+
+- copy upstream **runtime ideas** aggressively
+- trust only **local exact-match generation** for final profile selection
+- assume paper or README speedups are hypotheses until reproduced on the target model
+
+Recent upstream notes that matter for this branch:
+
+- the latest `yzamari/mlx-fork` work on `turboquant_attention` added broader
+  4-bit support; this branch already carries the equivalent fused-runtime path
+  in local `mlx`
+- the latest `yzamari/mlx-turboquant` / `turboQuantPlayground` updates are
+  mainly benchmark/docs updates, not proof that one public profile is exact on
+  every model family
+- the latest `tonbistudio/turboquant-pytorch` correction explicitly walked back
+  earlier invalid generation claims, which is one reason this README only shows
+  **real generation exact-match** tables
+- the latest `DeadByDawn101/turboquant-mlx` status note is aligned with what we
+  saw locally: a mathematically plausible design can still miss live QJL wiring
+  or compressed-domain attention support
+
 #### Practical Decision Rule
 
 1. Benchmark native first.

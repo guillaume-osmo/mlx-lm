@@ -313,6 +313,16 @@ def setup_arg_parser():
 generation_stream = mx.new_stream(mx.default_device())
 
 
+def _metal_device_info():
+    if not mx.metal.is_available():
+        return None
+    if hasattr(mx, "device_info"):
+        return mx.device_info()
+    if hasattr(mx.metal, "device_info"):
+        return mx.metal.device_info()
+    return None
+
+
 @contextlib.contextmanager
 def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     """
@@ -331,7 +341,8 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         model_bytes = tree_reduce(
             lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
         )
-        max_rec_size = mx.device_info()["max_recommended_working_set_size"]
+        device_info = _metal_device_info()
+        max_rec_size = device_info["max_recommended_working_set_size"]
         if model_bytes > 0.9 * max_rec_size:
             model_mb = model_bytes // 2**20
             max_rec_mb = max_rec_size // 2**20
@@ -1204,8 +1215,9 @@ class BatchGenerator:
         self.active_batch = None
 
         if mx.metal.is_available():
+            device_info = _metal_device_info()
             self._old_wired_limit = mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
+                device_info["max_recommended_working_set_size"]
             )
         else:
             self._old_wired_limit = None

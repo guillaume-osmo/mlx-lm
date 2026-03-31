@@ -217,13 +217,15 @@ def load_model(
                 return False
             return f"{p}.scales" in weights
 
-        nn.quantize(
-            model,
+        quantize_kwargs = dict(
+            model=model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
-            mode=quantization.get("mode", "affine"),
             class_predicate=class_predicate,
         )
+        if "mode" in inspect.signature(nn.quantize).parameters:
+            quantize_kwargs["mode"] = quantization.get("mode", "affine")
+        nn.quantize(**quantize_kwargs)
 
     if (quantization := config.get("quantization", None)) is not None:
         _quantize(quantization)
