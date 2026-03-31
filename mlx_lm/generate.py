@@ -272,6 +272,31 @@ def setup_arg_parser():
         help="[Experimental] Optional sparse-V attention threshold for TurboQuant fused decode.",
     )
     parser.add_argument(
+        "--turbo-sparse-v-mode",
+        type=str,
+        choices=["fixed", "percentile", "adaptive"],
+        default=None,
+        help="[Experimental] Sparse-V policy for TurboQuant fused decode.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-percentile",
+        type=float,
+        default=None,
+        help="[Experimental] Skip the bottom N%% of attention weights in sparse-V percentile/adaptive modes.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-early-multiplier",
+        type=float,
+        default=1.25,
+        help="[Experimental] Adaptive sparse-V multiplier for the first layer.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v-late-multiplier",
+        type=float,
+        default=0.75,
+        help="[Experimental] Adaptive sparse-V multiplier for the last layer.",
+    )
+    parser.add_argument(
         "--turbo-decode-buffer",
         action="store_true",
         help="[Experimental] Use an incremental dequantized K/V decode buffer for TurboQuant.",
@@ -424,6 +449,10 @@ def maybe_turboquant_kv_cache(
     turbo_qjl_residual: bool = True,
     turbo_qjl_projection_mode: str = "auto",
     turbo_sparse_v_tau: Optional[float] = None,
+    turbo_sparse_v_mode: Optional[str] = None,
+    turbo_sparse_v_percentile: Optional[float] = None,
+    turbo_sparse_v_early_multiplier: float = 1.25,
+    turbo_sparse_v_late_multiplier: float = 0.75,
     turbo_decode_buffer: bool = False,
     turbo_buffer_size: int = 0,
     turbo_flush_batch_size: int = 0,
@@ -443,6 +472,10 @@ def maybe_turboquant_kv_cache(
                 qjl_residual=turbo_qjl_residual,
                 qjl_projection_mode=turbo_qjl_projection_mode,
                 sparse_v_tau=turbo_sparse_v_tau,
+                sparse_v_mode=turbo_sparse_v_mode,
+                sparse_v_percentile=turbo_sparse_v_percentile,
+                sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+                sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
                 decode_buffer=turbo_decode_buffer,
                 buffer_size=turbo_buffer_size,
                 flush_batch_size=turbo_flush_batch_size,
@@ -473,6 +506,10 @@ def generate_step(
     turbo_qjl_residual: bool = True,
     turbo_qjl_projection_mode: str = "auto",
     turbo_sparse_v_tau: Optional[float] = None,
+    turbo_sparse_v_mode: Optional[str] = None,
+    turbo_sparse_v_percentile: Optional[float] = None,
+    turbo_sparse_v_early_multiplier: float = 1.25,
+    turbo_sparse_v_late_multiplier: float = 0.75,
     turbo_decode_buffer: bool = False,
     turbo_buffer_size: int = 0,
     turbo_flush_batch_size: int = 0,
@@ -529,6 +566,14 @@ def generate_step(
           ``prod`` mode: ``auto``, ``dense``, or ``wht``. Default: ``auto``.
         turbo_sparse_v_tau (float, optional): Optional sparse-V threshold applied
           in fused TurboQuant decode attention. Default: ``None``.
+        turbo_sparse_v_mode (str, optional): Sparse-V policy: ``fixed``,
+          ``percentile``, or ``adaptive``. Default: ``None``.
+        turbo_sparse_v_percentile (float, optional): Bottom percentage of
+          attention weights to skip in sparse-V percentile/adaptive modes.
+        turbo_sparse_v_early_multiplier (float): Adaptive sparse-V multiplier
+          for the first layer. Default: ``1.25``.
+        turbo_sparse_v_late_multiplier (float): Adaptive sparse-V multiplier
+          for the last layer. Default: ``0.75``.
         turbo_decode_buffer (bool): Keep a running dequantized K/V buffer and
           only materialize new tokens on decode. Default: ``False``.
         turbo_buffer_size (int): Keep this many recent TurboQuant tokens in
@@ -575,6 +620,10 @@ def generate_step(
             turbo_qjl_residual=turbo_qjl_residual,
             turbo_qjl_projection_mode=turbo_qjl_projection_mode,
             turbo_sparse_v_tau=turbo_sparse_v_tau,
+            turbo_sparse_v_mode=turbo_sparse_v_mode,
+            turbo_sparse_v_percentile=turbo_sparse_v_percentile,
+            turbo_sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+            turbo_sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
             turbo_decode_buffer=turbo_decode_buffer,
             turbo_buffer_size=turbo_buffer_size,
             turbo_flush_batch_size=turbo_flush_batch_size,
@@ -601,6 +650,10 @@ def generate_step(
         turbo_qjl_residual=turbo_qjl_residual,
         turbo_qjl_projection_mode=turbo_qjl_projection_mode,
         turbo_sparse_v_tau=turbo_sparse_v_tau,
+        turbo_sparse_v_mode=turbo_sparse_v_mode,
+        turbo_sparse_v_percentile=turbo_sparse_v_percentile,
+        turbo_sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+        turbo_sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
         turbo_decode_buffer=turbo_decode_buffer,
         turbo_buffer_size=turbo_buffer_size,
         turbo_flush_batch_size=turbo_flush_batch_size,
@@ -1774,6 +1827,10 @@ def main():
         turbo_qjl_residual=not args.turbo_disable_qjl,
         turbo_qjl_projection_mode=args.turbo_qjl_projection_mode,
         turbo_sparse_v_tau=args.turbo_sparse_v_tau,
+        turbo_sparse_v_mode=args.turbo_sparse_v_mode,
+        turbo_sparse_v_percentile=args.turbo_sparse_v_percentile,
+        turbo_sparse_v_early_multiplier=args.turbo_sparse_v_early_multiplier,
+        turbo_sparse_v_late_multiplier=args.turbo_sparse_v_late_multiplier,
         turbo_decode_buffer=args.turbo_decode_buffer,
         turbo_buffer_size=args.turbo_buffer_size,
         turbo_flush_batch_size=args.turbo_flush_batch_size,

@@ -4,11 +4,14 @@ import copy
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 
 from mlx_lm.generate import generate_step, maybe_quantize_kv_cache
 from mlx_lm.models.base import (
+    _apply_turbo_sparse_v,
+    _compute_turbo_sparse_v_mask,
     create_attention_mask,
     create_causal_mask,
     scaled_dot_product_attention,
@@ -1383,6 +1386,44 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(c.rotation_mode, "rotor3")
         self.assertAlmostEqual(c.sparse_v_tau, 1e-4, places=8)
 
+    def test_turbo_sparse_v_percentile_masks_bottom_half(self):
+        probs = mx.array([[[[0.01, 0.02, 0.03, 0.04, 0.30, 0.60]]]], dtype=mx.float32)
+        cache = SimpleNamespace(sparse_v_mode="percentile", sparse_v_percentile=50.0)
+        mask = _compute_turbo_sparse_v_mask(probs, cache)
+        mx.eval(mask)
+        self.assertEqual(mask.reshape(-1).tolist(), [False, False, False, True, True, True])
+
+    def test_turbo_sparse_v_adaptive_keeps_more_in_late_layers(self):
+        probs = mx.array([[[[0.001, 0.002, 0.004, 0.008, 0.16, 0.825]]]], dtype=mx.float32)
+        early = SimpleNamespace(
+            sparse_v_mode="adaptive",
+            sparse_v_percentile=50.0,
+            sparse_v_early_multiplier=1.25,
+            sparse_v_late_multiplier=0.75,
+            layer_idx=0,
+            num_layers=10,
+        )
+        late = SimpleNamespace(
+            sparse_v_mode="adaptive",
+            sparse_v_percentile=50.0,
+            sparse_v_early_multiplier=1.25,
+            sparse_v_late_multiplier=0.75,
+            layer_idx=9,
+            num_layers=10,
+        )
+        early_mask = _compute_turbo_sparse_v_mask(probs, early)
+        late_mask = _compute_turbo_sparse_v_mask(probs, late)
+        mx.eval(early_mask, late_mask)
+        self.assertLessEqual(int(mx.sum(early_mask).item()), int(mx.sum(late_mask).item()))
+
+    def test_turbo_sparse_v_renormalizes_masked_probs(self):
+        probs = mx.array([[[[0.01, 0.02, 0.07, 0.90]]]], dtype=mx.float32)
+        cache = SimpleNamespace(sparse_v_mode="percentile", sparse_v_percentile=50.0)
+        sparse = _apply_turbo_sparse_v(probs, cache)
+        mx.eval(sparse)
+        self.assertTrue(mx.allclose(mx.sum(sparse, axis=-1), mx.ones((1, 1, 1)), atol=1e-6))
+        self.assertEqual(float(sparse[..., 0].item()), 0.0)
+
     def test_turboquant_rotorquant_nondivisible_dim_stays_independent(self):
         """Test RotorQuant stays blockwise even when head dim is not divisible by 3."""
         c = TurboQuantKVCache(bits=4, rotation_mode="rotorquant")
@@ -1701,9 +1742,12 @@ class TestPromptCache(unittest.TestCase):
             dk, dv = cache.update_and_fetch(k, v)
 
             q = mx.random.normal(shape=(1, 8, 1, 128))
-            scores = q @ mx.swapaxes(dk, -1, -2)
+            repeats = q.shape[1] // dk.shape[1]
+            dk_rep = mx.repeat(dk, repeats=repeats, axis=1)
+            dv_rep = mx.repeat(dv, repeats=repeats, axis=1)
+            scores = q @ mx.swapaxes(dk_rep, -1, -2)
             probs = mx.softmax(scores, axis=-1, precise=True)
-            out_ref = probs @ dv
+            out_ref = probs @ dv_rep
 
             scores_fused = cache.fused_scores(q)
             probs_fused = mx.softmax(scores_fused, axis=-1, precise=True)
@@ -1739,9 +1783,12 @@ class TestPromptCache(unittest.TestCase):
             dk, dv = cache.update_and_fetch(k, v)
 
             q = mx.random.normal(shape=(1, 16, 1, 256))
-            scores = q @ mx.swapaxes(dk, -1, -2)
+            repeats = q.shape[1] // dk.shape[1]
+            dk_rep = mx.repeat(dk, repeats=repeats, axis=1)
+            dv_rep = mx.repeat(dv, repeats=repeats, axis=1)
+            scores = q @ mx.swapaxes(dk_rep, -1, -2)
             probs = mx.softmax(scores, axis=-1, precise=True)
-            out_ref = probs @ dv
+            out_ref = probs @ dv_rep
 
             scores_fused = cache.fused_scores(q)
             probs_fused = mx.softmax(scores_fused, axis=-1, precise=True)

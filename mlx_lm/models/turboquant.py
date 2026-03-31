@@ -776,6 +776,10 @@ class TurboQuantKVCache(_BaseCache):
         estimator_mode: str = "mse",
         qjl_residual: bool = True,
         sparse_v_tau: Optional[float] = None,
+        sparse_v_mode: Optional[str] = None,
+        sparse_v_percentile: Optional[float] = None,
+        sparse_v_early_multiplier: float = 1.25,
+        sparse_v_late_multiplier: float = 0.75,
         qjl_projection_mode: str = "auto",
         decode_buffer: bool = False,
         buffer_size: int = 0,
@@ -817,6 +821,10 @@ class TurboQuantKVCache(_BaseCache):
         self.estimator_mode = estimator_mode
         self.qjl_residual = bool(qjl_residual)
         self.sparse_v_tau = sparse_v_tau
+        self.sparse_v_mode = sparse_v_mode
+        self.sparse_v_percentile = sparse_v_percentile
+        self.sparse_v_early_multiplier = float(sparse_v_early_multiplier)
+        self.sparse_v_late_multiplier = float(sparse_v_late_multiplier)
         self.qjl_projection_mode = qjl_projection_mode
         self.decode_buffer = bool(decode_buffer)
         self.buffer_size = max(0, int(buffer_size))

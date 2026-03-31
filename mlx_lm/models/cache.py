@@ -22,6 +22,10 @@ def make_prompt_cache(
     turbo_qjl_residual: bool = True,
     turbo_qjl_projection_mode: str = "auto",
     turbo_sparse_v_tau: Optional[float] = None,
+    turbo_sparse_v_mode: Optional[str] = None,
+    turbo_sparse_v_percentile: Optional[float] = None,
+    turbo_sparse_v_early_multiplier: float = 1.25,
+    turbo_sparse_v_late_multiplier: float = 0.75,
     turbo_decode_buffer: bool = False,
     turbo_buffer_size: int = 0,
     turbo_flush_batch_size: int = 0,
@@ -61,6 +65,15 @@ def make_prompt_cache(
             ``prod`` mode.
         turbo_sparse_v_tau (Optional[float]): Optional sparse-V threshold for
             TurboQuant fused decode attention.
+        turbo_sparse_v_mode (Optional[str]): Sparse-V policy: ``fixed``,
+            ``percentile``, or ``adaptive``.
+        turbo_sparse_v_percentile (Optional[float]): Bottom percentage of
+            attention weights to skip when sparse-V mode is ``percentile`` or
+            ``adaptive``.
+        turbo_sparse_v_early_multiplier (float): Adaptive sparse-V multiplier
+            for the first layer.
+        turbo_sparse_v_late_multiplier (float): Adaptive sparse-V multiplier
+            for the last layer.
         turbo_decode_buffer (bool): Keep a running dequantized K/V decode buffer
             and only materialize new tokens on incremental decode steps.
         turbo_buffer_size (int): Keep this many recent tokens in FP16 and
@@ -98,6 +111,10 @@ def make_prompt_cache(
             estimator_mode=turbo_estimator_mode,
             qjl_residual=turbo_qjl_residual,
             sparse_v_tau=turbo_sparse_v_tau,
+            sparse_v_mode=turbo_sparse_v_mode,
+            sparse_v_percentile=turbo_sparse_v_percentile,
+            sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+            sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
             qjl_projection_mode=turbo_qjl_projection_mode,
             decode_buffer=turbo_decode_buffer,
             buffer_size=turbo_buffer_size,
@@ -116,8 +133,18 @@ def make_prompt_cache(
             decode_buffer=rotor_decode_buffer,
         )
 
+    def _annotate_layers(caches):
+        num_layers = len(caches)
+        for i, cache_obj in enumerate(caches):
+            try:
+                setattr(cache_obj, "layer_idx", i)
+                setattr(cache_obj, "num_layers", num_layers)
+            except Exception:
+                pass
+        return caches
+
     if hasattr(model, "make_cache"):
-        default_cache = model.make_cache()
+        default_cache = _annotate_layers(model.make_cache())
         if turbo_kv_bits is None and rotor_kv_bits is None:
             return default_cache
 
@@ -126,12 +153,12 @@ def make_prompt_cache(
             turbo_fp16_layers if turbo_kv_bits is not None else rotor_fp16_layers
         )
         to_backend = _to_turboquant if turbo_kv_bits is not None else _to_rotorquant
-        return [
+        return _annotate_layers([
             c
             if i < fp16_layers or i >= num_layers - fp16_layers
             else to_backend(c)
             for i, c in enumerate(default_cache)
-        ]
+        ])
 
     num_layers = len(model.layers)
     if turbo_kv_bits is not None or rotor_kv_bits is not None:
@@ -141,7 +168,7 @@ def make_prompt_cache(
                 "--max-kv-size on models without make_cache()."
             )
         if turbo_kv_bits is not None:
-            return [
+            return _annotate_layers([
                 KVCache().to_turboquant(
                     bits=turbo_kv_bits,
                     key_bits=turbo_key_bits,
@@ -150,6 +177,10 @@ def make_prompt_cache(
                     estimator_mode=turbo_estimator_mode,
                     qjl_residual=turbo_qjl_residual,
                     sparse_v_tau=turbo_sparse_v_tau,
+                    sparse_v_mode=turbo_sparse_v_mode,
+                    sparse_v_percentile=turbo_sparse_v_percentile,
+                    sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
+                    sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
                     qjl_projection_mode=turbo_qjl_projection_mode,
                     decode_buffer=turbo_decode_buffer,
                     buffer_size=turbo_buffer_size,
@@ -157,7 +188,7 @@ def make_prompt_cache(
                     max_cache_tokens=turbo_max_kv_size,
                 )
                 for _ in range(num_layers)
-            ]
+            ])
         return [
             KVCache().to_rotorquant(
                 bits=rotor_kv_bits,
@@ -549,6 +580,10 @@ class KVCache(_BaseCache):
         estimator_mode: str = "mse",
         qjl_residual: bool = True,
         sparse_v_tau: Optional[float] = None,
+        sparse_v_mode: Optional[str] = None,
+        sparse_v_percentile: Optional[float] = None,
+        sparse_v_early_multiplier: float = 1.25,
+        sparse_v_late_multiplier: float = 0.75,
         qjl_projection_mode: str = "auto",
         decode_buffer: bool = False,
         buffer_size: int = 0,
@@ -577,6 +612,14 @@ class KVCache(_BaseCache):
                 keys when using ``prod`` mode.
             sparse_v_tau (Optional[float]): Optional threshold for sparse-V gating
                 during fused decode attention.
+            sparse_v_mode (Optional[str]): Sparse-V policy: ``fixed``,
+                ``percentile``, or ``adaptive``.
+            sparse_v_percentile (Optional[float]): Bottom percentage of weights
+                to skip in sparse-V percentile/adaptive modes.
+            sparse_v_early_multiplier (float): Adaptive sparse-V multiplier for
+                the first layer.
+            sparse_v_late_multiplier (float): Adaptive sparse-V multiplier for
+                the last layer.
             qjl_projection_mode (str): QJL projection backend for ``prod`` mode:
                 ``auto``, ``dense``, or ``wht``.
             decode_buffer (bool): Keep a running dequantized K/V decode buffer
@@ -599,6 +642,10 @@ class KVCache(_BaseCache):
             estimator_mode=estimator_mode,
             qjl_residual=qjl_residual,
             sparse_v_tau=sparse_v_tau,
+            sparse_v_mode=sparse_v_mode,
+            sparse_v_percentile=sparse_v_percentile,
+            sparse_v_early_multiplier=sparse_v_early_multiplier,
+            sparse_v_late_multiplier=sparse_v_late_multiplier,
             qjl_projection_mode=qjl_projection_mode,
             decode_buffer=decode_buffer,
             buffer_size=buffer_size,
@@ -621,6 +668,10 @@ class KVCache(_BaseCache):
         estimator_mode: str = "mse",
         qjl_residual: bool = True,
         sparse_v_tau: Optional[float] = None,
+        sparse_v_mode: Optional[str] = None,
+        sparse_v_percentile: Optional[float] = None,
+        sparse_v_early_multiplier: float = 1.25,
+        sparse_v_late_multiplier: float = 0.75,
         qjl_projection_mode: str = "auto",
         decode_buffer: bool = False,
         buffer_size: int = 0,
@@ -636,6 +687,10 @@ class KVCache(_BaseCache):
             estimator_mode=estimator_mode,
             qjl_residual=qjl_residual,
             sparse_v_tau=sparse_v_tau,
+            sparse_v_mode=sparse_v_mode,
+            sparse_v_percentile=sparse_v_percentile,
+            sparse_v_early_multiplier=sparse_v_early_multiplier,
+            sparse_v_late_multiplier=sparse_v_late_multiplier,
             qjl_projection_mode=qjl_projection_mode,
             decode_buffer=decode_buffer,
             buffer_size=buffer_size,
