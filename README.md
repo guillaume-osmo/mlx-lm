@@ -260,6 +260,19 @@ memory without automatically being faster than native**. On some models the
 cost is well amortized and throughput stays near native or improves. On other
 models the main win is cache size, not raw decode speed.
 
+One important implementation detail in this branch: the asymmetric exact winner
+`prod, K=3, V=4, QJL off` now auto-enables the safe fused path by default.
+That fused path is **not** the one-pass single-bit-width decode kernel, because
+that primitive assumes the same bit-width for keys and values. For `K=3/V=4`
+we instead route through the correct split path:
+
+- fused packed-key scores
+- softmax
+- fused packed-value aggregation
+
+That fix matters because it removes a real formal bug: forcing `K=3/V=4`
+through a shared-bit decode primitive is mathematically wrong.
+
 #### Exact-Match Results On This Machine
 
 Measured on:
@@ -311,6 +324,10 @@ Best current example:
 --turbo-fp16-layers 2 \
 --turbo-decode-buffer
 ```
+
+In current builds, this profile auto-enables the fused packed path when the
+runtime supports it. Use `MLX_TQ_FUSED=0` only if you want to force the older
+reference path for debugging.
 
 Best current examples:
 

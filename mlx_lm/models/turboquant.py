@@ -41,6 +41,8 @@ _BOUNDARIES = {
 }
 # fmt: on
 
+_FALSY_ENV_VALUES = {"0", "false", "f", "no"}
+
 
 def _rotation_matrix_dense(dim, seed=42):
     """Haar-distributed random orthogonal matrix via QR of Gaussian."""
@@ -219,6 +221,28 @@ def _normalize_override_bits(bits, name):
     if _is_fractional_bits(bits):
         raise ValueError(f"{name} must be an integer bit-width, got {bits}")
     return int(bits)
+
+
+def _env_fused_enabled():
+    value = os.environ.get("MLX_TQ_FUSED")
+    if value is None:
+        return None
+    return value.lower() not in _FALSY_ENV_VALUES
+
+
+def _prefer_fused_default(
+    bits,
+    key_bits,
+    value_bits,
+    rotation_mode,
+    estimator_mode,
+    qjl_residual,
+):
+    if rotation_mode != "dense" or estimator_mode != "prod" or qjl_residual:
+        return False
+    effective_key_bits = key_bits if key_bits is not None else int(bits)
+    effective_value_bits = value_bits if value_bits is not None else int(bits)
+    return effective_key_bits == 3 and effective_value_bits == 4
 
 
 def _select_fractional_indices(keys, values, avg_bits):
@@ -833,11 +857,18 @@ class TurboQuantKVCache(_BaseCache):
         self._deq_alloc = 0
         self._buffer_keys = None
         self._buffer_values = None
-        self._fused_enabled = os.environ.get("MLX_TQ_FUSED", "0").lower() not in (
-            "0",
-            "false",
-            "f",
-            "no",
+        fused_env = _env_fused_enabled()
+        self._fused_enabled = (
+            _prefer_fused_default(
+                bits,
+                key_bits,
+                value_bits,
+                rotation_mode,
+                estimator_mode,
+                self.qjl_residual,
+            )
+            if fused_env is None
+            else fused_env
         )
 
     def _ensure_runtime_attrs(self):
@@ -904,11 +935,18 @@ class TurboQuantKVCache(_BaseCache):
         if not hasattr(self, "_buffer_values"):
             self._buffer_values = None
         if not hasattr(self, "_fused_enabled"):
-            self._fused_enabled = os.environ.get("MLX_TQ_FUSED", "0").lower() not in (
-                "0",
-                "false",
-                "f",
-                "no",
+            fused_env = _env_fused_enabled()
+            self._fused_enabled = (
+                _prefer_fused_default(
+                    self.turbo_bits,
+                    self.key_bits_override,
+                    self.value_bits_override,
+                    self.rotation_mode,
+                    self.estimator_mode,
+                    self.qjl_residual,
+                )
+                if fused_env is None
+                else fused_env
             )
         if not hasattr(self, "qjl_projection_mode"):
             self.qjl_projection_mode = "auto"
@@ -1552,6 +1590,7 @@ class TurboQuantKVCache(_BaseCache):
         can_use_native_decode = can_use_fused_decode and (
             (
                 (self.estimator_mode == "mse" or not self.qjl_residual)
+                and self._k_bits == self._v_bits
                 and hasattr(mx.fast, "turboquant_decode_attention_packed_batched")
             )
             or (
@@ -1757,6 +1796,8 @@ class TurboQuantKVCache(_BaseCache):
                     self._head_dim,
                 )
         else:
+            if self._k_bits != self._v_bits:
+                return None
             if hasattr(mx.fast, "turboquant_decode_attention_packed_model_batched"):
                 out = mx.fast.turboquant_decode_attention_packed_model_batched(
                     q_rot_in,

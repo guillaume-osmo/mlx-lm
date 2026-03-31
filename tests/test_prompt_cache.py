@@ -1614,6 +1614,147 @@ class TestPromptCache(unittest.TestCase):
             else:
                 os.environ["MLX_TQ_FUSED"] = prev
 
+    def test_turboquant_prod_no_qjl_k3_v4_defaults_fused_on(self):
+        """The exact k3/v4 winner should auto-enable the fused packed path."""
+        prev = os.environ.pop("MLX_TQ_FUSED", None)
+        try:
+            cache = TurboQuantKVCache(
+                bits=4,
+                key_bits=3,
+                value_bits=4,
+                estimator_mode="prod",
+                qjl_residual=False,
+            )
+            self.assertTrue(cache._fused_enabled)
+
+            x = mx.random.normal(shape=(1, 2, 3, 128))
+            cache.update_and_fetch(x, x)
+            self.assertEqual(cache._k_bits, 3)
+            self.assertEqual(cache._v_bits, 4)
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
+    def test_turboquant_prod_no_qjl_env_can_disable_fused_default(self):
+        prev = os.environ.get("MLX_TQ_FUSED")
+        os.environ["MLX_TQ_FUSED"] = "0"
+        try:
+            cache = TurboQuantKVCache(
+                bits=4,
+                key_bits=3,
+                value_bits=4,
+                estimator_mode="prod",
+                qjl_residual=False,
+            )
+            self.assertFalse(cache._fused_enabled)
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
+    def test_turboquant_prod_no_qjl_k3_v4_skips_invalid_one_pass_decode_op(self):
+        """k3/v4 must not route through the single-bit-width one-pass decode op."""
+        prev = os.environ.pop("MLX_TQ_FUSED", None)
+        try:
+            cache = TurboQuantKVCache(
+                bits=4,
+                key_bits=3,
+                value_bits=4,
+                rotation_mode="dense",
+                estimator_mode="prod",
+                qjl_residual=False,
+            )
+            k = mx.random.normal(shape=(1, 2, 7, 128))
+            v = mx.random.normal(shape=(1, 2, 7, 128))
+            cache.update_and_fetch(k, v)
+
+            q = mx.random.normal(shape=(1, 8, 1, 128))
+            self.assertIsNone(cache.fused_attention(q))
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
+    def test_turboquant_prod_no_qjl_k3_v4_fused_scores_av_matches_reference_gqa128(self):
+        """Exact winner math should match the dequantized path for head_dim=128."""
+        if not hasattr(mx.fast, "turboquant_qk_packed_scores_batched"):
+            self.skipTest("Native TurboQuant packed score op unavailable")
+        if not hasattr(mx.fast, "turboquant_av_packed_values_batched"):
+            self.skipTest("Native TurboQuant packed AV op unavailable")
+
+        prev = os.environ.pop("MLX_TQ_FUSED", None)
+        try:
+            cache = TurboQuantKVCache(
+                bits=4,
+                key_bits=3,
+                value_bits=4,
+                rotation_mode="dense",
+                estimator_mode="prod",
+                qjl_residual=False,
+            )
+            k = mx.random.normal(shape=(1, 2, 9, 128))
+            v = mx.random.normal(shape=(1, 2, 9, 128))
+            dk, dv = cache.update_and_fetch(k, v)
+
+            q = mx.random.normal(shape=(1, 8, 1, 128))
+            scores = q @ mx.swapaxes(dk, -1, -2)
+            probs = mx.softmax(scores, axis=-1, precise=True)
+            out_ref = probs @ dv
+
+            scores_fused = cache.fused_scores(q)
+            probs_fused = mx.softmax(scores_fused, axis=-1, precise=True)
+            out_fused = cache.fused_av(probs_fused)
+            mx.eval(out_ref, scores_fused, probs_fused, out_fused)
+
+            self.assertTrue(mx.allclose(out_fused, out_ref, rtol=4e-3, atol=4e-3))
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
+    def test_turboquant_prod_no_qjl_k3_v4_fused_scores_av_matches_reference_gqa256(self):
+        """Exact winner math should match the dequantized path for head_dim=256."""
+        if not hasattr(mx.fast, "turboquant_qk_packed_scores_batched"):
+            self.skipTest("Native TurboQuant packed score op unavailable")
+        if not hasattr(mx.fast, "turboquant_av_packed_values_batched"):
+            self.skipTest("Native TurboQuant packed AV op unavailable")
+
+        prev = os.environ.pop("MLX_TQ_FUSED", None)
+        try:
+            cache = TurboQuantKVCache(
+                bits=4,
+                key_bits=3,
+                value_bits=4,
+                rotation_mode="dense",
+                estimator_mode="prod",
+                qjl_residual=False,
+            )
+            k = mx.random.normal(shape=(1, 2, 7, 256))
+            v = mx.random.normal(shape=(1, 2, 7, 256))
+            dk, dv = cache.update_and_fetch(k, v)
+
+            q = mx.random.normal(shape=(1, 16, 1, 256))
+            scores = q @ mx.swapaxes(dk, -1, -2)
+            probs = mx.softmax(scores, axis=-1, precise=True)
+            out_ref = probs @ dv
+
+            scores_fused = cache.fused_scores(q)
+            probs_fused = mx.softmax(scores_fused, axis=-1, precise=True)
+            out_fused = cache.fused_av(probs_fused)
+            mx.eval(out_ref, scores_fused, probs_fused, out_fused)
+
+            self.assertTrue(mx.allclose(out_fused, out_ref, rtol=5e-3, atol=5e-3))
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
     def test_turboquant_with_model(self):
         """Test TurboQuantKVCache with actual model generation."""
         num_layers = len(self.model.layers)
