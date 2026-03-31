@@ -132,6 +132,13 @@ def _apply_block_rotation(vectors, block_rotation):
 def _rotation_matrix(dim, seed=42, mode="dense"):
     if mode == "dense":
         return _rotation_matrix_dense(dim, seed=seed)
+    if mode == "wht":
+        if not hasattr(mx, "hadamard_transform") or not _supports_hadamard_dim(dim):
+            raise ValueError(
+                f"WHT rotation does not support head_dim={dim}; "
+                "supported sizes are m*2^k where m in {1, 12, 20, 28}."
+            )
+        return _random_signs(dim, seed + dim * 131 + 17)
     if mode == "rotor3":
         return _rotation_blocks_rotor3(dim, seed=seed)
     if mode == "rotorquant":
@@ -147,6 +154,8 @@ def _cached_rotation_pair(dim, seed=42, mode="dense"):
         return fallback, fallback.T
     if mode == "dense":
         return rotation, rotation.T
+    if mode == "wht":
+        return rotation, rotation
     return rotation, mx.swapaxes(rotation, -1, -2)
 
 
@@ -238,7 +247,7 @@ def _prefer_fused_default(
     estimator_mode,
     qjl_residual,
 ):
-    if rotation_mode != "dense" or estimator_mode != "prod" or qjl_residual:
+    if rotation_mode not in ("dense", "wht") or estimator_mode != "prod" or qjl_residual:
         return False
     effective_key_bits = key_bits if key_bits is not None else int(bits)
     effective_value_bits = value_bits if value_bits is not None else int(bits)
@@ -281,12 +290,16 @@ def _merge_split_tensors(low_tensor, high_tensor, restore_order):
 
 
 def _apply_rotation(vectors, rotation_t, mode="dense"):
+    if rotation_t.ndim == 1:
+        return mx.hadamard_transform(vectors.astype(mx.float32) * rotation_t.astype(mx.float32))
     if rotation_t.ndim == 2:
         return vectors @ rotation_t
     return _apply_block_rotation(vectors, rotation_t)
 
 
 def _apply_inverse_rotation(vectors, rotation, mode="dense"):
+    if rotation.ndim == 1:
+        return mx.hadamard_transform(vectors.astype(mx.float32)) * rotation.astype(mx.float32)
     if rotation.ndim == 2:
         return vectors @ rotation
     return _apply_block_rotation(vectors, rotation)
@@ -794,9 +807,9 @@ class TurboQuantKVCache(_BaseCache):
                 "Explicit key_bits/value_bits overrides do not yet support "
                 f"fractional turbo bits, got bits={bits}"
             )
-        if rotation_mode not in ("dense", "rotor3", "rotorquant"):
+        if rotation_mode not in ("dense", "wht", "rotor3", "rotorquant"):
             raise ValueError(
-                "rotation_mode must be 'dense', 'rotor3', or 'rotorquant', "
+                "rotation_mode must be 'dense', 'wht', 'rotor3', or 'rotorquant', "
                 f"got {rotation_mode}"
             )
         if estimator_mode not in ("mse", "prod"):
@@ -1752,6 +1765,7 @@ class TurboQuantKVCache(_BaseCache):
         )
         q_rot_in = _fused_input(q_rot, mx.float32)
         used_model_basis_native = False
+        supports_model_basis_native = getattr(self._rotation, "ndim", 2) != 1
         if self.estimator_mode == "prod" and self.qjl_residual:
             fast_scores = self._fused_prod_scores_metal(
                 queries_scaled,
@@ -1763,7 +1777,9 @@ class TurboQuantKVCache(_BaseCache):
                 out = self.fused_av(probs)
                 if out is not None:
                     return out
-            if hasattr(mx.fast, "turboquant_decode_attention_prod_model_batched"):
+            if supports_model_basis_native and hasattr(
+                mx.fast, "turboquant_decode_attention_prod_model_batched"
+            ):
                 out = mx.fast.turboquant_decode_attention_prod_model_batched(
                     q_rot_in,
                     _fused_input(queries_scaled, mx.float32),
@@ -1806,7 +1822,9 @@ class TurboQuantKVCache(_BaseCache):
         else:
             if self._k_bits != self._v_bits:
                 return None
-            if hasattr(mx.fast, "turboquant_decode_attention_packed_model_batched"):
+            if supports_model_basis_native and hasattr(
+                mx.fast, "turboquant_decode_attention_packed_model_batched"
+            ):
                 out = mx.fast.turboquant_decode_attention_packed_model_batched(
                     q_rot_in,
                     _fused_input(self._k_indices[..., : packed_tokens, :]),
@@ -2114,7 +2132,7 @@ class TurboQuantKVCache(_BaseCache):
         self.turbo_bits = _normalize_turbo_bits(v[1])
         head_dim = int(v[2])
         self.rotation_mode = v[3] if len(v) >= 4 else "dense"
-        if self.rotation_mode not in ("dense", "rotor3", "rotorquant"):
+        if self.rotation_mode not in ("dense", "wht", "rotor3", "rotorquant"):
             self.rotation_mode = "dense"
         if len(v) >= 5:
             sparse_tau = float(v[4])

@@ -33,6 +33,9 @@ from mlx_lm.models.cache import (
 from mlx_lm.models.rotorquant import RotorQuantKVCache
 from mlx_lm.models.turboquant import (
     TurboQuantKVCache,
+    _apply_inverse_rotation,
+    _apply_rotation,
+    _cached_rotation_pair,
     _cached_qjl_projection,
     _metal_available,
     _metal_qjl_score,
@@ -1402,6 +1405,29 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(c.rotation_mode, "rotor3")
         self.assertAlmostEqual(c.sparse_v_tau, 1e-4, places=8)
 
+    def test_turboquant_wht_rotation_roundtrip(self):
+        """WHT base rotation should be self-inverse on supported head dims."""
+        rotation, rotation_t = _cached_rotation_pair(128, mode="wht")
+        x = mx.random.normal(shape=(2, 3, 128))
+        xr = _apply_rotation(x, rotation_t, mode="wht")
+        xi = _apply_inverse_rotation(xr, rotation, mode="wht")
+        mx.eval(xi)
+        self.assertTrue(mx.allclose(xi, x.astype(mx.float32), rtol=1e-5, atol=1e-5))
+
+    def test_turboquant_wht_mode_wiring_and_cache_state(self):
+        """Test TurboQuant WHT mode wiring and cache state."""
+        c = TurboQuantKVCache(bits=4, rotation_mode="wht", sparse_v_tau=1e-4)
+        k = mx.random.normal(shape=(1, 8, 12, 128))
+        v = mx.random.normal(shape=(1, 8, 12, 128))
+        dk, dv = c.update_and_fetch(k, v)
+        mx.eval(dk, dv)
+
+        self.assertEqual(c.size(), 12)
+        self.assertEqual(c.rotation_mode, "wht")
+        self.assertEqual(c._rotation.ndim, 1)
+        self.assertEqual(c._rotation.shape[0], 128)
+        self.assertAlmostEqual(c.sparse_v_tau, 1e-4, places=8)
+
     def test_turbo_sparse_v_percentile_masks_bottom_half(self):
         probs = mx.array([[[[0.01, 0.02, 0.03, 0.04, 0.30, 0.60]]]], dtype=mx.float32)
         cache = SimpleNamespace(sparse_v_mode="percentile", sparse_v_percentile=50.0)
@@ -1812,6 +1838,47 @@ class TestPromptCache(unittest.TestCase):
             mx.eval(out_ref, scores_fused, probs_fused, out_fused)
 
             self.assertTrue(mx.allclose(out_fused, out_ref, rtol=5e-3, atol=5e-3))
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_TQ_FUSED", None)
+            else:
+                os.environ["MLX_TQ_FUSED"] = prev
+
+    def test_turboquant_prod_no_qjl_k3_v4_fused_scores_av_matches_reference_wht_gqa256(self):
+        """Exact winner math should also match with WHT base rotation."""
+        if not hasattr(mx.fast, "turboquant_qk_packed_scores_batched"):
+            self.skipTest("Native TurboQuant packed score op unavailable")
+        if not hasattr(mx.fast, "turboquant_av_packed_values_batched"):
+            self.skipTest("Native TurboQuant packed AV op unavailable")
+
+        prev = os.environ.pop("MLX_TQ_FUSED", None)
+        try:
+            cache = TurboQuantKVCache(
+                bits=4,
+                key_bits=3,
+                value_bits=4,
+                rotation_mode="wht",
+                estimator_mode="prod",
+                qjl_residual=False,
+            )
+            k = mx.random.normal(shape=(1, 2, 7, 256))
+            v = mx.random.normal(shape=(1, 2, 7, 256))
+            dk, dv = cache.update_and_fetch(k, v)
+
+            q = mx.random.normal(shape=(1, 16, 1, 256))
+            repeats = q.shape[1] // dk.shape[1]
+            dk_rep = mx.repeat(dk, repeats=repeats, axis=1)
+            dv_rep = mx.repeat(dv, repeats=repeats, axis=1)
+            scores = q @ mx.swapaxes(dk_rep, -1, -2)
+            probs = mx.softmax(scores, axis=-1, precise=True)
+            out_ref = probs @ dv_rep
+
+            scores_fused = cache.fused_scores(q)
+            probs_fused = mx.softmax(scores_fused, axis=-1, precise=True)
+            out_fused = cache.fused_av(probs_fused)
+            mx.eval(out_ref, scores_fused, probs_fused, out_fused)
+
+            self.assertTrue(mx.allclose(out_fused, out_ref, rtol=6e-3, atol=6e-3))
         finally:
             if prev is None:
                 os.environ.pop("MLX_TQ_FUSED", None)

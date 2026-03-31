@@ -107,7 +107,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--turbo-rotation-mode",
         type=str,
-        choices=["dense", "rotor3", "rotorquant"],
+        choices=["dense", "wht", "rotor3", "rotorquant"],
         default="dense",
         help="[Experimental] TurboQuant rotation mode.",
     )
