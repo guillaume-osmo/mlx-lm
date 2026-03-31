@@ -236,141 +236,122 @@ for more usage details.
 
 ### Experimental TurboQuant Tuning
 
-This branch includes experimental TurboQuant KV-cache compression features in
-`mlx_lm.generate` / `mlx_lm.benchmark`, including:
+This branch adds experimental TurboQuant KV-cache compression to
+`mlx_lm.generate` and `mlx_lm.benchmark`.
 
-- separate key/value bit-widths
-- optional 1-bit QJL residual correction for `prod` mode
-- FP16 "edge layers" to protect the first/last layers
-- an incremental decode buffer for faster compressed decode
-- optional oldest-token eviction for fixed-size compressed caches
+The short version is:
 
-The main practical takeaway from the current Apple Silicon runs is simple:
-there is **no single best compressed-KV profile across models**. The best
-speed/accuracy trade-off is model-dependent, so the recommended way to use
-TurboQuant in this branch is to start with a per-model profile and then tune
-around it.
+- **cache memory savings are real and repeatable**
+- **speed is model-dependent**
+- **there is no single best profile for every model family**
 
-This also means that paper-level results should be treated as a direction, not
-as a drop-in expectation for every model on MLX. In practice, **memory
-reduction transfers much more reliably than speedups**. Speed can improve on
-some model families, but the compressed path still pays a real preprocessing
-cost for rotation, quantization, packing, optional QJL correction, and decode
-buffer maintenance. If that overhead is not amortized well by the target
-architecture and workload, the run will become smaller in memory but not
-necessarily faster in tokens/sec.
+Paper results should be treated as a direction, not as a drop-in expectation
+for MLX. The compressed path adds real math before the fast attention kernel
+can run:
 
-Measured on this exact machine:
+- rotate queries / keys into the compression basis
+- normalize and quantize keys / values
+- bit-pack compressed tensors
+- optionally apply the 1-bit QJL residual correction
+- maintain the recent decode buffer and merge it with compressed history
+
+That extra preprocessing cost is why compressed KV can be **much smaller in
+memory without automatically being faster than native**. On some models the
+cost is well amortized and throughput stays near native or improves. On other
+models the main win is cache size, not raw decode speed.
+
+#### Exact-Match Results On This Machine
+
+Measured on:
 
 - Apple M3 Max
-- 16 CPU cores
 - 128 GB unified memory
 
-Current local reference points on this machine (greedy decode, exact-match
-check against native on the generated suffix):
+`Exact match` below means: **greedy generation produced the exact same token
+suffix as native on the listed workload and prompt**. This is a measured
+property of these runs, not a blanket guarantee for every prompt.
 
-| Model | Workload | Native gen tok/s | Recommended compressed profile | Compressed gen tok/s | Cache MB | Notes |
-| --- | --- | ---: | --- | ---: | ---: | --- |
-| `mlx-community/Qwen2.5-7B-Instruct-4bit` | `4096` prompt / `16` decode | `41.2` | `--turbo-kv-bits 4 --turbo-key-bits 3 --turbo-value-bits 4 --turbo-estimator-mode prod --turbo-disable-qjl --turbo-fp16-layers 4 --turbo-decode-buffer` | `40.1` | `54.4` | exact, `-2.7%` decode speed vs native, `-77.1%` cache; QJL was not consistently helpful on this 7B family |
-| `mlx-community/Qwen2.5-32B-Instruct-4bit` | `4096` prompt / `16` decode | `9.9` | `--turbo-kv-bits 4 --turbo-estimator-mode mse --turbo-fp16-layers 2 --turbo-decode-buffer` | `8.8` | `273.0` | exact, `-11.2%` decode speed vs native, `-74.9%` cache; the simple 4-bit MSE profile was the most robust winner |
-| `mlx-community/Qwen3.5-35B-A3B-4bit` | `8192` prompt / `16` decode | `18.0` | `--turbo-kv-bits 4 --turbo-estimator-mode prod --turbo-fp16-layers 2 --turbo-qjl-projection-mode wht --turbo-decode-buffer` | `18.4` | `86.8` | exact, `+1.8%` decode speed vs native, `-55.8%` cache; this hybrid model benefited from the QJL-backed `prod` path |
+| Model | Workload | Best exact profile so far | Native gen tok/s | Compressed gen tok/s | Cache MB (native -> compressed) | Exact match | Takeaway |
+| --- | --- | --- | ---: | ---: | --- | --- | --- |
+| `mlx-community/Qwen2.5-7B-Instruct-4bit` | `4096` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off** | `43.4` | `39.8` | `238.0 -> 54.4` | `16/16` | strong memory win, moderate speed cost |
+| `mlx-community/Qwen2.5-32B-Instruct-4bit` | `4096` prompt / `16` decode | `mse`, `4-bit` | `9.8` | `10.1` | `1088.0 -> 273.0` | `16/16` | best current dense 32B profile |
+| `mlx-community/Qwen3.5-35B-A3B-4bit` | `16384` prompt / `50` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `34.56` | `34.46` | `356.41 -> 131.61` | `50/50` | near-native speed, large cache win |
+| `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `46.54` | `42.87` | `288.0 -> 90.65` | `16/16` | very good compromise |
+| `mlx-community/Meta-Llama-3.1-8B-Instruct-8bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `27.69` | `27.81` | `288.0 -> 90.65` | `16/16` | cache win at speed parity |
+| `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `107.38` | `119.74` | `432.0 -> 157.62` | `16/16` | best speed+memory result so far |
 
-These numbers are the main reason this branch recommends a model-tuned
-workflow instead of a single “paper” profile:
+These runs are why this branch now recommends a **model-tuned** workflow
+instead of a single "paper" profile.
 
-- on some families, compressed KV is almost free in throughput
-- on some families, compressed KV is mainly a memory win
-- and on some families, the best path changes depending on whether QJL helps
+#### Two Practical Profiles
 
-The underlying reason is that this MLX implementation still pays a real
-preprocessing bill before the fast attention path can benefit:
+If you want a clean starting point, use one of these two profiles first:
 
-- rotate / normalize keys and values
-- quantize and pack indices
-- optionally compute and apply the QJL residual correction
-- maintain the incremental decode buffer
+**1. Simple dense baseline for models that prefer `mse`**
 
-That preprocessing cost is exactly why this branch can be **much smaller in
-cache memory without automatically matching native speed**. If the model
-architecture amortizes the compressed path well, you can win on both. If it
-does not, you still get the memory reduction, but the tokens/sec gain may stay
-flat or even regress slightly.
+```bash
+--turbo-kv-bits 4 \
+--turbo-estimator-mode mse \
+--turbo-fp16-layers 2 \
+--turbo-decode-buffer
+```
 
-Two extra notes are worth keeping in mind:
+Best current example:
 
-1. `--turbo-max-kv-size` is currently an aggressive research knob, not a safe
-   default. Naive fixed-size eviction reduced cache size further but clearly
-   hurt exactness in the current runs.
-2. Fractional `2.5` / `3.5`-bit TurboQuant modes are implemented and exact in
-   this branch, but they currently use a safe split-cache fallback that is not
-   yet a speed winner. If you care primarily about throughput, start with the
-   integer-bit profiles above.
+- `mlx-community/Qwen2.5-32B-Instruct-4bit`
 
-#### What the Main Options Mean
+**2. Best exact profile so far for several 7B/8B-style families**
 
-If you just want the best practical profile, these are the important knobs:
+```bash
+--turbo-kv-bits 4 \
+--turbo-key-bits 3 \
+--turbo-value-bits 4 \
+--turbo-estimator-mode prod \
+--turbo-disable-qjl \
+--turbo-fp16-layers 2 \
+--turbo-decode-buffer
+```
 
-- `--turbo-kv-bits N`
-  Turn on TurboQuant compression at `N` bits. In the current MLX path, `4`
-  bits is the safest starting point for real workloads.
-- `--turbo-key-bits K --turbo-value-bits V`
-  Override key and value precision separately. This is useful when keys are
-  more sensitive than values and can improve the speed/accuracy compromise on
-  some models.
-- `--turbo-estimator-mode mse`
-  The simplest and most robust option. Start here first.
-- `--turbo-estimator-mode prod`
-  A more aggressive path that can help on some models, especially when paired
-  with QJL, but should always be benchmarked on the target model family.
-- `--turbo-disable-qjl`
-  Turns off the 1-bit QJL residual correction in `prod` mode. This can help or
-  hurt depending on the model. It is not a universally good or bad toggle.
-- `--turbo-fp16-layers N`
-  Keep the first `N` and last `N` layers in their default FP16 cache form.
-  This is one of the most useful stability knobs in practice.
-- `--turbo-decode-buffer`
-  Keeps a live dequantized decode buffer to reduce the decode penalty of
-  compressed KV. This is usually the right default when throughput matters.
-- `--turbo-max-kv-size`
-  Enforces a hard compressed-cache limit by evicting the oldest tokens. This
-  saves more memory, but should be treated as a separate experiment because it
-  can easily hurt accuracy.
+Best current examples:
+
+- `mlx-community/Qwen3.5-35B-A3B-4bit` at long context
+- `mlx-community/Mistral-7B-Instruct-v0.3-4bit`
+- `mlx-community/Meta-Llama-3.1-8B-Instruct-8bit`
+- `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit`
+
+For `Qwen2.5-7B-Instruct-4bit`, the same `prod no-QJL k3/v4` family is also
+currently the best exact TurboQuant profile, but with a larger throughput hit
+than on Mistral / Llama / SmolLM2.
+
+#### QJL Is Not A Universal Default
+
+QJL is a tuning knob, not a rule.
+
+Current local evidence:
+
+- `Qwen2.5-7B-Instruct-4bit`: best exact `prod` profile is **without** QJL
+- `Qwen2.5-32B-Instruct-4bit`: best exact profile is still plain `4-bit mse`
+- `Qwen3.5-35B-A3B-4bit`: `prod + QJL` can still help at short context, but at
+  `16K` and `32K` the best exact profile is currently `prod` **without** QJL
+
+If you care about exactness, benchmark `prod` both **with** and **without**
+QJL on the target model before deciding.
 
 #### Practical Decision Rule
 
-If your goal is a strong speed/accuracy compromise on Apple Silicon, the most
-reliable workflow today is:
-
 1. Benchmark native first.
 2. Benchmark `4-bit mse`.
-3. Try `--turbo-fp16-layers`.
-4. Try asymmetric `K/V` bits.
-5. Only then test `prod` and `QJL`.
+3. If needed, try FP16 edge layers.
+4. Then try asymmetric `K/V` bits.
+5. Only after that, benchmark `prod`.
+6. If you use `prod`, test both **QJL on** and **QJL off**.
 
-In other words: **do not assume a paper profile transfers directly**. Benchmark
-and tune on the exact model family you care about.
+Two important caveats:
 
-Example benchmark command:
-
-```bash
-mlx_lm.benchmark \
-  --model mlx-community/Qwen3.5-35B-A3B-4bit \
-  --prompt-tokens 8192 \
-  --generation-tokens 16 \
-  --turbo-kv-bits 4 \
-  --turbo-estimator-mode prod \
-  --turbo-fp16-layers 2 \
-  --turbo-qjl-projection-mode wht \
-  --turbo-decode-buffer
-```
-
-If you are unsure where to start:
-
-- start with plain `4-bit mse`
-- try asymmetric `K/V` bits next
-- enable `prod` + QJL only if it helps on your target model
-- treat fixed-size eviction as a separate experiment, not as the baseline
-- benchmark on the exact model family you care about before generalizing
+1. `--turbo-max-kv-size` is still a research knob. Naive fixed-size eviction
+   reduced memory further, but clearly hurt exactness in the current runs.
+2. Fractional `2.5` / `3.5`-bit modes exist in this branch, but they are not
+   the current throughput winners.
 
 ### Supported Models
 
