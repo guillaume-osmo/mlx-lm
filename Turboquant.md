@@ -1,6 +1,6 @@
 # TurboQuant Model Guide
 
-This file is the short practical companion to the main [README](/Users/tgg/turboquant-m3max/mlx-lm/README.md).
+This file is the short practical companion to the main [README](README.md).
 It only answers one question:
 
 **If you want the best speed/accuracy/memory compromise on this machine, which model/profile should you start with?**

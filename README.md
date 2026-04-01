@@ -285,7 +285,7 @@ suffix as native on the listed workload and prompt**. This is a measured
 property of these runs, not a blanket guarantee for every prompt.
 
 For a shorter model-picker version of this section, see
-[Turboquant.MD](/Users/tgg/turboquant-m3max/mlx-lm/Turboquant.MD).
+[Turboquant.md](Turboquant.md).
 
 **Best model by family**
 
