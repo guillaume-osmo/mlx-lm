@@ -10,6 +10,13 @@ Machine used for all rows below:
 - 128 GB unified memory
 - Python 3.12
 
+Recommended runtime flags for the exact profiles below:
+
+```bash
+export MLX_TQ_FUSED=1
+export MLX_TQ_QK_CENTROID_LUT=1
+```
+
 `Exact match` means greedy generation produced the same generated suffix as native on the listed workload.
 
 ## Best Model By Family
@@ -61,9 +68,11 @@ Machine used for all rows below:
 
 ## How To Reproduce
 
-Run the full validated benchmark sweep with:
+Run the full validated benchmark sweep with the faster fused runtime enabled:
 
 ```bash
+MLX_TQ_FUSED=1 \
+MLX_TQ_QK_CENTROID_LUT=1 \
 /Users/tgg/turboquant-m3max/.venv-py3.12-local/bin/python \
   /Users/tgg/Downloads/turboquant_m3max_bundle/turboquantbenchmarch.py \
   --models qwen35_long_exact deepseek_r1_qwen_7b deepseek_r1_qwen_14b \
@@ -81,6 +90,8 @@ List the available reproducible benchmark cases:
 Print the exact generation command for one winning preset:
 
 ```bash
+MLX_TQ_FUSED=1 \
+MLX_TQ_QK_CENTROID_LUT=1 \
 python3 /Users/tgg/Downloads/turboquant_m3max_bundle/turboquantdemo.py \
   --preset qwen35_long_exact --print-only
 ```
@@ -88,6 +99,8 @@ python3 /Users/tgg/Downloads/turboquant_m3max_bundle/turboquantdemo.py \
 Run a single validated winner preset end-to-end:
 
 ```bash
+MLX_TQ_FUSED=1 \
+MLX_TQ_QK_CENTROID_LUT=1 \
 python3 /Users/tgg/Downloads/turboquant_m3max_bundle/turboquantdemo.py \
   --preset deepseek_qwen_7b_best
 ```
