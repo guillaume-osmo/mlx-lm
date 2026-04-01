@@ -3,6 +3,10 @@
 MLX LM is a Python package for generating text and fine-tuning large language
 models on Apple silicon with MLX.
 
+For this TurboQuant branch, the expected MLX runtime is the fork at
+`guillaume-osmo/mlx` on branch `codex/turboquant-prod-qk`, not the stock
+`ml-explore/mlx` package.
+
 Some key features include:
 
 * Integration with the Hugging Face Hub to easily use thousands of LLMs with a

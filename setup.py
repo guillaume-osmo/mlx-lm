@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,6 +12,11 @@ sys.path.append(str(package_dir))
 from _version import __version__
 
 MIN_MLX_VERSION = "0.30.4"
+MLX_GIT_REF = os.environ.get(
+    "MLX_GIT_REF",
+    "git+https://github.com/guillaume-osmo/mlx.git@codex/turboquant-prod-qk",
+)
+MLX_DEPENDENCY = f"mlx @ {MLX_GIT_REF}; platform_system == 'Darwin'"
 
 setup(
     name="mlx-lm",
@@ -24,7 +30,7 @@ setup(
     url="https://github.com/ml-explore/mlx-lm",
     license="MIT",
     install_requires=[
-        f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
+        MLX_DEPENDENCY,
         "numpy",
         "transformers>=5.0.0",
         "sentencepiece",

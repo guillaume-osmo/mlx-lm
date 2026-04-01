@@ -10,6 +10,9 @@ Machine used for all rows below:
 - 128 GB unified memory
 - Python 3.12
 
+This guide assumes the forked MLX runtime from `guillaume-osmo/mlx` on branch
+`codex/turboquant-prod-qk`, not the stock `ml-explore/mlx` package.
+
 Recommended runtime flags for the exact profiles below:
 
 ```bash
