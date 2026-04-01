@@ -22,7 +22,7 @@ Machine used for all rows below:
 | Llama | `mlx-community/DeepSeek-R1-Distill-Llama-8B-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `46.96` | `44.15` | `288.0 -> 118.84` | `16/16` | Best Llama-family speed/accuracy compromise |
 | Mistral | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `48.75` | `46.59` | `288.0 -> 118.84` | `16/16` | Best Mistral-family exact compromise |
 | Gemma | `mlx-community/gemma-3-text-12b-it-4bit` | `2048` prompt / `16` decode | `mse`, `4-bit` | `26.73` | `26.64` | `464.0 -> 367.09` | `16/16` | Exact, but the gain is small; native is still reasonable |
-| SmolLM | `mlx-community/SmolLM3-3B-4bit` | `2048` prompt / `16` decode | `mse`, `4-bit` | `93.45` | `81.07` | `162.0 -> 45.39` | `16/16` | Native is faster, but memory reduction is large and exact |
+| SmolLM | `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `107.38` | `119.74` | `432.0 -> 157.62` | `16/16` | Strongest speed+memory win in the small-model family |
 
 ## What The Numbers Mean
 
