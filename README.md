@@ -3,6 +3,10 @@
 MLX LM is a Python package for generating text and fine-tuning large language
 models on Apple silicon with MLX.
 
+For this TurboQuant branch, the expected MLX runtime is the fork at
+`guillaume-osmo/mlx` on branch `codex/turboquant-prod-qk`, not the stock
+`ml-explore/mlx` package.
+
 Some key features include:
 
 * Integration with the Hugging Face Hub to easily use thousands of LLMs with a
@@ -296,7 +300,7 @@ For a shorter model-picker version of this section, see
 | Qwen (long context) | `mlx-community/Qwen3.5-35B-A3B-4bit` | `16384` prompt / `50` decode | `prod`, `K=3`, `V=4`, QJL **off**, dense rotation, fused on, late-5 FP16 layers | `34.56` | `35.52` | `356.41 -> 231.52` | `50/50` | exact, smaller cache, slightly faster than native on the tie-break |
 | Llama | `mlx-community/DeepSeek-R1-Distill-Llama-8B-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `47.49` | `47.82` | `288.0 -> 118.84` | `16/16` | best Llama-family speed/accuracy compromise in the fused/LUT rerun |
 | Mistral | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `47.04` | `46.77` | `288.0 -> 118.84` | `16/16` | best Mistral-family exact compromise |
-| Gemma | `mlx-community/gemma-3-text-12b-it-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-2 FP16 layers | `26.21` | `27.54` | `464.0 -> 364.44` | `16/16` | exact and slightly faster than native on this workload, but the memory win is still modest |
+| Gemma | `mlx-community/gemma-4-e2b-it-4bit` | `2048` prompt / `16` decode | `mse`, `3.5-bit`, half split, edge-2 FP16 layers | `55.54` | `89.73` | `19.50 -> 12.40` | `16/16` | strongest Gemma-family exact result so far on this machine |
 | SmolLM | `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `111.56` | `109.01` | `432.0 -> 130.18` | `16/16` | best SmolLM-family memory/throughput compromise in the refreshed fused/LUT run |
 
 **Full exact benchmark table**
@@ -312,12 +316,52 @@ For a shorter model-picker version of this section, see
 | `mlx-community/DeepSeek-R1-Distill-Llama-8B-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `47.49` | `47.82` | `288.0 -> 118.84` | `16/16` | best Llama-family speed/accuracy compromise in the refreshed fused/LUT run |
 | `mlx-community/Meta-Llama-3.1-8B-Instruct-8bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `27.95` | `26.91` | `288.0 -> 118.84` | `16/16` | best exact compressed profile in the refreshed fused/LUT run |
 | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `47.04` | `46.77` | `288.0 -> 118.84` | `16/16` | best Mistral-family exact compromise |
-| `mlx-community/gemma-3-text-12b-it-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-2 FP16 layers | `26.21` | `27.54` | `464.0 -> 364.44` | `16/16` | exact and slightly faster than native on this workload |
+| `mlx-community/gemma-4-e2b-it-4bit` | `2048` prompt / `16` decode | `mse`, `3.5-bit`, half split, edge-2 FP16 layers | `55.54` | `89.73` | `19.50 -> 12.40` | `16/16` | strongest Gemma-family exact result so far on this machine |
 | `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `111.56` | `109.01` | `432.0 -> 130.18` | `16/16` | best SmolLM-family memory/throughput compromise in the refreshed fused/LUT run |
 | `mlx-community/SmolLM3-3B-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off** | `89.85` | `74.64` | `162.0 -> 42.18` | `16/16` | native stays faster, but the exact cache reduction is strong |
 
 These runs are why this branch now recommends a **model-tuned** workflow
 instead of a single "paper" profile.
+
+#### Gemma 4 Sanity Check: Real Prompt, Real Answers
+
+Some short Gemma 4 benchmark prompts produced unusually easy continuations, so
+we also ran a plain text-generation sanity check to make sure the models were
+not "winning" by returning empty or degenerate output.
+
+Prompt used for all rows below:
+
+```text
+In two short sentences, explain why exact-match validation matters for TurboQuant.
+```
+
+| Model | Output excerpt | Note |
+| --- | --- | --- |
+| `mlx-community/gemma-4-e2b-it-4bit` | `Exact-match validation ensures that the input data precisely matches the expected format ...` | Real text output, not an empty completion |
+| `unsloth/gemma-4-E4B-it-UD-MLX-4bit` | `Exact-match validation ensures that the data ingested by TurboQuant precisely aligns ...` | Real text output; `UD` is the Unsloth Dynamic MLX variant |
+| `mlx-community/gemma-4-e4b-it-6bit` | `Exact-match validation ensures that the data ingested into TurboQuant precisely aligns ...` | Real text output from the community 6-bit MLX checkpoint |
+
+Example outputs:
+
+```text
+mlx-community/gemma-4-e2b-it-4bit
+Exact-match validation ensures that the input data precisely matches the expected format, which is crucial for the high-precision calculations TurboQuant relies upon. This prevents errors in complex algorithms by guaranteeing the integrity of the data before processing.
+```
+
+```text
+unsloth/gemma-4-E4B-it-UD-MLX-4bit
+Exact-match validation ensures that the data ingested by TurboQuant precisely aligns with expected formats and identifiers. This strictness is crucial for maintaining data integrity and enabling accurate, reliable quantitative analysis.
+```
+
+```text
+mlx-community/gemma-4-e4b-it-6bit
+Exact-match validation ensures that the data ingested into TurboQuant precisely aligns with expected formats and identifiers. This accuracy is crucial for reliable quantitative analysis, preventing misinterpretations or errors in financial modeling.
+```
+
+This matters because the short `2048 / 16` benchmark continuation for
+`gemma-4-e2b-it-4bit` was unusually favorable (`"This is a comparison.<turn|>..."`).
+So the benchmark run is real, but the sanity-check prompt above is the better
+proof that Gemma 4 support in this branch produces normal text.
 
 #### Two Practical Profiles
 
@@ -359,7 +403,7 @@ Best current examples:
 - `mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit`
 - `mlx-community/DeepSeek-R1-Distill-Llama-8B-4bit`
 - `mlx-community/Mistral-7B-Instruct-v0.3-4bit`
-- `mlx-community/gemma-3-text-12b-it-4bit`
+- `mlx-community/gemma-4-e2b-it-4bit`
 - `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit`
 - `mlx-community/SmolLM3-3B-4bit`
 
