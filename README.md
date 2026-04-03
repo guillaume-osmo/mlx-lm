@@ -322,6 +322,18 @@ For a shorter model-picker version of this section, see
 | `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `111.56` | `109.01` | `432.0 -> 130.18` | `16/16` | best SmolLM-family memory/throughput compromise in the refreshed fused/LUT run |
 | `mlx-community/SmolLM3-3B-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off** | `89.85` | `74.64` | `162.0 -> 42.18` | `16/16` | native stays faster, but the exact cache reduction is strong |
 
+**Params vs tokens/s**
+
+The plot below uses the full exact table above. The x-axis is the total
+parameter count implied by the model name (in billions). The y-axis is
+generation throughput. Blue points are native; red points are the best exact
+compressed profile we measured for that row.
+
+![TurboQuant benchmarks: parameters vs tokens per second](assets/turboquant_tok_s_vs_params.svg)
+
+CSV source:
+- [benchmarks/turboquant_tok_s_vs_params.csv](benchmarks/turboquant_tok_s_vs_params.csv)
+
 These runs are why this branch now recommends a **model-tuned** workflow
 instead of a single "paper" profile.
 

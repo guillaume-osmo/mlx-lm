@@ -1,0 +1,82 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='980' height='700' viewBox='0 0 980 700'>
+<rect width='980' height='700' fill='#ffffff'/>
+<text x='80' y='34' font-family='Helvetica,Arial,sans-serif' font-size='26' font-weight='700' fill='#111827'>TurboQuant Benchmarks: Parameters vs Tokens/s</text>
+<text x='80' y='58' font-family='Helvetica,Arial,sans-serif' font-size='14' fill='#6b7280'>X-axis: total parameter count implied by model name (billions). Y-axis: generation tokens/s. Blue = native, red = exact compressed winner.</text>
+<line x1='80' y1='620.0' x2='940' y2='620.0' stroke='#d1d5db' stroke-width='1'/>
+<text x='70' y='625.0' text-anchor='end' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>0</text>
+<line x1='80' y1='528.3' x2='940' y2='528.3' stroke='#d1d5db' stroke-width='1'/>
+<text x='70' y='533.3' text-anchor='end' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>20</text>
+<line x1='80' y1='436.7' x2='940' y2='436.7' stroke='#d1d5db' stroke-width='1'/>
+<text x='70' y='441.7' text-anchor='end' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>40</text>
+<line x1='80' y1='345.0' x2='940' y2='345.0' stroke='#d1d5db' stroke-width='1'/>
+<text x='70' y='350.0' text-anchor='end' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>60</text>
+<line x1='80' y1='253.3' x2='940' y2='253.3' stroke='#d1d5db' stroke-width='1'/>
+<text x='70' y='258.3' text-anchor='end' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>80</text>
+<line x1='80' y1='161.7' x2='940' y2='161.7' stroke='#d1d5db' stroke-width='1'/>
+<text x='70' y='166.7' text-anchor='end' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>100</text>
+<line x1='80' y1='70.0' x2='940' y2='70.0' stroke='#d1d5db' stroke-width='1'/>
+<text x='70' y='75.0' text-anchor='end' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>120</text>
+<line x1='92.3' y1='70' x2='92.3' y2='620' stroke='#d1d5db' stroke-width='1'/>
+<text x='92.3' y='644' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>2</text>
+<line x1='141.4' y1='70' x2='141.4' y2='620' stroke='#d1d5db' stroke-width='1'/>
+<text x='141.4' y='644' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>4</text>
+<line x1='215.1' y1='70' x2='215.1' y2='620' stroke='#d1d5db' stroke-width='1'/>
+<text x='215.1' y='644' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>7</text>
+<line x1='239.7' y1='70' x2='239.7' y2='620' stroke='#d1d5db' stroke-width='1'/>
+<text x='239.7' y='644' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>8</text>
+<line x1='387.1' y1='70' x2='387.1' y2='620' stroke='#d1d5db' stroke-width='1'/>
+<text x='387.1' y='644' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>14</text>
+<line x1='829.4' y1='70' x2='829.4' y2='620' stroke='#d1d5db' stroke-width='1'/>
+<text x='829.4' y='644' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>32</text>
+<line x1='903.1' y1='70' x2='903.1' y2='620' stroke='#d1d5db' stroke-width='1'/>
+<text x='903.1' y='644' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='12' fill='#6b7280'>35</text>
+<line x1='80' y1='620' x2='940' y2='620' stroke='#111827' stroke-width='2'/>
+<line x1='80' y1='70' x2='80' y2='620' stroke='#111827' stroke-width='2'/>
+<text x='510.0' y='676' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='15' fill='#111827'>Parameters (B)</text>
+<text x='24' y='345.0' transform='rotate(-90 24 345.0)' text-anchor='middle' font-family='Helvetica,Arial,sans-serif' font-size='15' fill='#111827'>Generation tokens / second</text>
+<circle cx='680' cy='90' r='6' fill='#2563eb'/><text x='694' y='95' font-family='Helvetica,Arial,sans-serif' font-size='14' fill='#111827'>Native</text>
+<rect x='674' y='108' width='12' height='12' fill='#dc2626'/><text x='694' y='119' font-family='Helvetica,Arial,sans-serif' font-size='14' fill='#111827'>Compressed exact winner</text>
+<circle cx='215.1' cy='410.7' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='209.6' y='409.8' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='223.1' y='407.3' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Qwen2.5-7B</text>
+<circle cx='215.1' cy='395.6' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='209.6' y='384.6' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='223.1' y='370.1' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>DS-R1-Qwen-7B</text>
+<circle cx='829.4' cy='568.7' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='823.9' y='566.4' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='837.4' y='589.9' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Qwen2.5-32B</text>
+<circle cx='387.1' cy='506.1' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='381.6' y='500.4' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='395.1' y='497.9' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>DS-R1-Qwen-14B</text>
+<circle cx='903.1' cy='461.6' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='897.6' y='451.7' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='895.1' y='447.2' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Qwen3.5-35B 16K</text>
+<circle cx='903.1' cy='579.9' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='897.6' y='572.7' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='895.1' y='596.2' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Qwen3.5-35B 32K</text>
+<circle cx='239.7' cy='402.3' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='234.2' y='395.3' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='247.7' y='392.8' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>DS-R1-Llama-8B</text>
+<circle cx='239.7' cy='491.9' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='234.2' y='491.2' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='247.7' y='514.7' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Llama-3.1-8B</text>
+<circle cx='215.1' cy='404.4' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='209.6' y='400.1' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='223.1' y='423.6' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Mistral-7B</text>
+<circle cx='92.3' cy='365.4' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='86.8' y='203.2' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='100.3' y='198.7' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Gemma-4-E2B</text>
+<circle cx='141.4' cy='464.5' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='135.9' y='568.9' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='149.4' y='592.4' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Gemma-4-E4B-UD</text>
+<circle cx='141.4' cy='577.1' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='135.9' y='453.0' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='149.4' y='450.5' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>Gemma-4-E4B-6bit</text>
+<circle cx='84.9' cy='108.7' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='79.4' y='114.9' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='92.9' y='112.4' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>SmolLM2-1.7B</text>
+<circle cx='116.9' cy='208.2' r='5.5' fill='#2563eb' stroke='white' stroke-width='1.5'/>
+<rect x='111.4' y='272.4' width='11' height='11' fill='#dc2626' stroke='white' stroke-width='1.5'/>
+<text x='124.9' y='269.9' font-family='Helvetica,Arial,sans-serif' font-size='11.5' fill='#111827'>SmolLM3-3B</text>
+<text x='80' y='692' font-family='Helvetica,Arial,sans-serif' font-size='11' fill='#6b7280'>Exact rows taken from Turboquant.md full benchmark table. Gemma 4 E4B 6bit remains provisional pending longer reruns.</text>
+</svg>
