@@ -51,6 +51,38 @@ export MLX_TQ_QK_CENTROID_LUT=1
 | `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `111.56` | `109.01` | `432.0 -> 130.18` | `16/16` | Best SmolLM-family memory/throughput compromise in the refreshed fused/LUT run |
 | `mlx-community/SmolLM3-3B-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off** | `89.85` | `74.64` | `162.0 -> 42.18` | `16/16` | Native stays faster, but the exact cache reduction is strong |
 
+## Gemma 4 Sanity Check
+
+To make sure the Gemma 4 benchmark rows are not just "fast nonsense", we also
+ran a plain generation prompt on the supported Gemma 4 checkpoints.
+
+Prompt:
+
+```text
+In two short sentences, explain why exact-match validation matters for TurboQuant.
+```
+
+Outputs:
+
+```text
+mlx-community/gemma-4-e2b-it-4bit
+Exact-match validation ensures that the input data precisely matches the expected format, which is crucial for the high-precision calculations TurboQuant relies upon. This prevents errors in complex algorithms by guaranteeing the integrity of the data before processing.
+```
+
+```text
+unsloth/gemma-4-E4B-it-UD-MLX-4bit
+Exact-match validation ensures that the data ingested by TurboQuant precisely aligns with expected formats and identifiers. This strictness is crucial for maintaining data integrity and enabling accurate, reliable quantitative analysis.
+```
+
+```text
+mlx-community/gemma-4-e4b-it-6bit
+Exact-match validation ensures that the data ingested into TurboQuant precisely aligns with expected formats and identifiers. This accuracy is crucial for reliable quantitative analysis, preventing misinterpretations or errors in financial modeling.
+```
+
+This is worth calling out because the short benchmark continuation for
+`gemma-4-e2b-it-4bit` was unusually easy. The sanity-check prompt confirms that
+the Gemma 4 adapters in this branch produce normal text, not empty output.
+
 ## What The Numbers Mean
 
 - `mse, 4-bit`:

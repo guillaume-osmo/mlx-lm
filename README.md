@@ -323,6 +323,46 @@ For a shorter model-picker version of this section, see
 These runs are why this branch now recommends a **model-tuned** workflow
 instead of a single "paper" profile.
 
+#### Gemma 4 Sanity Check: Real Prompt, Real Answers
+
+Some short Gemma 4 benchmark prompts produced unusually easy continuations, so
+we also ran a plain text-generation sanity check to make sure the models were
+not "winning" by returning empty or degenerate output.
+
+Prompt used for all rows below:
+
+```text
+In two short sentences, explain why exact-match validation matters for TurboQuant.
+```
+
+| Model | Output excerpt | Note |
+| --- | --- | --- |
+| `mlx-community/gemma-4-e2b-it-4bit` | `Exact-match validation ensures that the input data precisely matches the expected format ...` | Real text output, not an empty completion |
+| `unsloth/gemma-4-E4B-it-UD-MLX-4bit` | `Exact-match validation ensures that the data ingested by TurboQuant precisely aligns ...` | Real text output; `UD` is the Unsloth Dynamic MLX variant |
+| `mlx-community/gemma-4-e4b-it-6bit` | `Exact-match validation ensures that the data ingested into TurboQuant precisely aligns ...` | Real text output from the community 6-bit MLX checkpoint |
+
+Example outputs:
+
+```text
+mlx-community/gemma-4-e2b-it-4bit
+Exact-match validation ensures that the input data precisely matches the expected format, which is crucial for the high-precision calculations TurboQuant relies upon. This prevents errors in complex algorithms by guaranteeing the integrity of the data before processing.
+```
+
+```text
+unsloth/gemma-4-E4B-it-UD-MLX-4bit
+Exact-match validation ensures that the data ingested by TurboQuant precisely aligns with expected formats and identifiers. This strictness is crucial for maintaining data integrity and enabling accurate, reliable quantitative analysis.
+```
+
+```text
+mlx-community/gemma-4-e4b-it-6bit
+Exact-match validation ensures that the data ingested into TurboQuant precisely aligns with expected formats and identifiers. This accuracy is crucial for reliable quantitative analysis, preventing misinterpretations or errors in financial modeling.
+```
+
+This matters because the short `2048 / 16` benchmark continuation for
+`gemma-4-e2b-it-4bit` was unusually favorable (`"This is a comparison.<turn|>..."`).
+So the benchmark run is real, but the sanity-check prompt above is the better
+proof that Gemma 4 support in this branch produces normal text.
+
 #### Two Practical Profiles
 
 If you want a clean starting point, use one of these two profiles first:
