@@ -48,6 +48,8 @@ export MLX_TQ_QK_CENTROID_LUT=1
 | `mlx-community/Meta-Llama-3.1-8B-Instruct-8bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `27.95` | `26.91` | `288.0 -> 118.84` | `16/16` | Best exact compressed profile in the refreshed fused/LUT run |
 | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-4 FP16 layers | `47.04` | `46.77` | `288.0 -> 118.84` | `16/16` | Best Mistral-family exact compromise |
 | `mlx-community/gemma-4-e2b-it-4bit` | `2048` prompt / `16` decode | `mse`, `3.5-bit`, half split, edge-2 FP16 layers | `55.54` | `89.73` | `19.50 -> 12.40` | `16/16` | Strongest Gemma-family exact result so far on this machine |
+| `unsloth/gemma-4-E4B-it-UD-MLX-4bit` | `2048` prompt / `16` decode | `mse`, `4-bit` | `33.93` | `9.95` | `56.00 -> 35.14` | `16/16` | Exact and healthy, but clearly not a speed win on this short harness |
+| `mlx-community/gemma-4-e4b-it-6bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, edge-2 FP16 layers | `9.37` | `35.24` | `56.00 -> 34.57` | `16/16` | Exact and surprisingly fast on this short harness; treat as provisional until a longer rerun confirms it |
 | `Irfanuruchi/SmolLM2-1.7B-Instruct-MLX-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off**, fused on | `111.56` | `109.01` | `432.0 -> 130.18` | `16/16` | Best SmolLM-family memory/throughput compromise in the refreshed fused/LUT run |
 | `mlx-community/SmolLM3-3B-4bit` | `2048` prompt / `16` decode | `prod`, `K=3`, `V=4`, QJL **off** | `89.85` | `74.64` | `162.0 -> 42.18` | `16/16` | Native stays faster, but the exact cache reduction is strong |
 
