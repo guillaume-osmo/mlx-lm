@@ -1231,6 +1231,51 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gemma4(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs(
+            model_type="gemma4",
+            text_config={
+                "model_type": "gemma4_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 6,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1024,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 256,
+                "hidden_size_per_layer_input": 32,
+                "sliding_window": 64,
+                "max_position_embeddings": 1024,
+                "rope_parameters": {
+                    "sliding_attention": {"rope_theta": 10000.0},
+                    "full_attention": {"rope_theta": 1000000.0},
+                },
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "final_logit_softcapping": 30.0,
+                "attention_k_eq_v": False,
+                "attention_bias": False,
+            },
+        )
+        model = gemma4.Model(args)
+        self.model_test_runner(
+            model,
+            args.model_type,
+            args.text_config["vocab_size"],
+            args.text_config["num_hidden_layers"],
+        )
+
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode
 

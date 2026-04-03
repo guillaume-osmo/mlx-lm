@@ -52,6 +52,7 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "qwen3_5_moe": "qwen3_5",
     "qwen3_5_moe_text": "qwen3_5",
+    "gemma4_for_conditional_generation": "gemma4",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
 }
