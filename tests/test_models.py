@@ -8,7 +8,11 @@ import mlx.nn as nn
 from mlx.utils import tree_map
 
 from mlx_lm.models import rope_utils
-from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
+from mlx_lm.models.base import (
+    create_attention_mask,
+    create_causal_mask,
+    scaled_dot_product_attention,
+)
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
@@ -1230,6 +1234,80 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_gemma4(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs(
+            model_type="gemma4",
+            text_config={
+                "model_type": "gemma4_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 6,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1024,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 256,
+                "hidden_size_per_layer_input": 32,
+                "sliding_window": 64,
+                "max_position_embeddings": 1024,
+                "rope_parameters": {
+                    "sliding_attention": {"rope_theta": 10000.0},
+                    "full_attention": {"rope_theta": 1000000.0},
+                },
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "final_logit_softcapping": 30.0,
+                "attention_k_eq_v": False,
+                "attention_bias": False,
+            },
+        )
+        model = gemma4.Model(args)
+        self.model_test_runner(
+            model,
+            args.model_type,
+            args.text_config["vocab_size"],
+            args.text_config["num_hidden_layers"],
+        )
+
+    def test_ouro_ut_norm_each_step(self):
+        from mlx_lm.models import ouro
+
+        args = ouro.ModelArgs(
+            model_type="ouro",
+            hidden_size=64,
+            num_hidden_layers=3,
+            intermediate_size=160,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=256,
+            head_dim=16,
+            total_ut_steps=2,
+            tie_word_embeddings=False,
+        )
+        model = ouro.Model(args)
+        tokens = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+        direct = model.model(tokens)
+        h = model.model.embed_tokens(tokens)
+        mask = create_attention_mask(h, None)
+        for _ in range(args.total_ut_steps):
+            for layer in model.model.layers:
+                h = layer(h, mask, None)
+            h = model.model.norm(h)
+
+        self.assertTrue(mx.allclose(direct, h, atol=1e-5, rtol=1e-5))
 
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode
