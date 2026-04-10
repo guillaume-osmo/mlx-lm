@@ -275,6 +275,19 @@ def setup_arg_parser():
         help="[Experimental] TurboQuant QJL projection backend for 'prod' mode.",
     )
     parser.add_argument(
+        "--turbo-qjl-scale",
+        type=float,
+        default=None,
+        help="[Experimental] Override the TurboQuant QJL score correction coefficient.",
+    )
+    parser.add_argument(
+        "--turbo-fractional-split-mode",
+        type=str,
+        choices=["importance", "half"],
+        default="importance",
+        help="[Experimental] Channel split policy for fractional TurboQuant bit-widths.",
+    )
+    parser.add_argument(
         "--turbo-disable-qjl",
         action="store_true",
         help="[Experimental] Disable the 1-bit QJL residual correction in TurboQuant prod mode.",
@@ -334,6 +347,28 @@ def setup_arg_parser():
         help="[Experimental] Keep at most this many TurboQuant tokens by evicting the oldest compressed tokens.",
     )
     parser.add_argument(
+        "--turbo-calibrate",
+        type=int,
+        default=None,
+        help="[Experimental] Run codebook calibration using the first N tokens "
+        "of the prompt. Replaces Gaussian codebooks with data-driven "
+        "quantile-estimated codebooks.",
+    )
+    parser.add_argument(
+        "--turbo-codebook-path",
+        type=str,
+        default=None,
+        help="[Experimental] Path to a .safetensors file with calibrated "
+        "TurboQuant codebooks. See mlx_lm.calibrate_turboquant.",
+    )
+    parser.add_argument(
+        "--turbo-deferred-quant",
+        action="store_true",
+        default=False,
+        help="[Experimental] Keep KV in FP16 during prefill, compress only "
+        "at decode time. Avoids error compounding during prompt processing.",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -344,6 +379,20 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--triattention-calib",
+        type=str,
+        default=None,
+        help="[Experimental] Path to TriAttention calibration .safetensors "
+        "file. Enables trigonometric KV cache pruning (arXiv:2604.04921).",
+    )
+    parser.add_argument(
+        "--triattention-budget",
+        type=int,
+        default=2048,
+        help="[Experimental] Maximum KV tokens to retain after TriAttention "
+        "compression. Default: 2048.",
     )
     return parser
 
@@ -462,6 +511,8 @@ def maybe_turboquant_kv_cache(
     turbo_estimator_mode: str = "mse",
     turbo_qjl_residual: bool = True,
     turbo_qjl_projection_mode: str = "auto",
+    turbo_qjl_scale: Optional[float] = None,
+    turbo_fractional_split_mode: str = "importance",
     turbo_sparse_v_tau: Optional[float] = None,
     turbo_sparse_v_mode: Optional[str] = None,
     turbo_sparse_v_percentile: Optional[float] = None,
@@ -471,6 +522,9 @@ def maybe_turboquant_kv_cache(
     turbo_buffer_size: int = 0,
     turbo_flush_batch_size: int = 0,
     turbo_max_kv_size: int = 0,
+    turbo_codebook_override=None,
+    turbo_rotation_override=None,
+    turbo_deferred_quant: bool = False,
 ):
     """Convert KV caches to TurboQuant compression (experimental)."""
     if turbo_kv_bits is None:
@@ -485,6 +539,8 @@ def maybe_turboquant_kv_cache(
                 estimator_mode=turbo_estimator_mode,
                 qjl_residual=turbo_qjl_residual,
                 qjl_projection_mode=turbo_qjl_projection_mode,
+                qjl_scale=turbo_qjl_scale,
+                fractional_split_mode=turbo_fractional_split_mode,
                 sparse_v_tau=turbo_sparse_v_tau,
                 sparse_v_mode=turbo_sparse_v_mode,
                 sparse_v_percentile=turbo_sparse_v_percentile,
@@ -494,6 +550,9 @@ def maybe_turboquant_kv_cache(
                 buffer_size=turbo_buffer_size,
                 flush_batch_size=turbo_flush_batch_size,
                 max_cache_tokens=turbo_max_kv_size,
+                codebook_override=turbo_codebook_override,
+                rotation_override=turbo_rotation_override,
+                deferred_quant=turbo_deferred_quant,
             )
 
 
@@ -520,6 +579,8 @@ def generate_step(
     turbo_estimator_mode: str = "mse",
     turbo_qjl_residual: bool = True,
     turbo_qjl_projection_mode: str = "auto",
+    turbo_qjl_scale: Optional[float] = None,
+    turbo_fractional_split_mode: str = "importance",
     turbo_sparse_v_tau: Optional[float] = None,
     turbo_sparse_v_mode: Optional[str] = None,
     turbo_sparse_v_percentile: Optional[float] = None,
@@ -529,6 +590,11 @@ def generate_step(
     turbo_buffer_size: int = 0,
     turbo_flush_batch_size: int = 0,
     turbo_max_kv_size: int = 0,
+    turbo_codebook_override=None,
+    turbo_rotation_override=None,
+    turbo_deferred_quant: bool = False,
+    triattention_calib: Optional[str] = None,
+    triattention_budget: int = 2048,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -582,6 +648,10 @@ def generate_step(
           keys in TurboQuant ``prod`` mode. Default: ``True``.
         turbo_qjl_projection_mode (str): QJL projection backend for TurboQuant
           ``prod`` mode: ``auto``, ``dense``, or ``wht``. Default: ``auto``.
+        turbo_qjl_scale (float, optional): Override the QJL score correction
+          coefficient. ``None`` keeps the theoretical default.
+        turbo_fractional_split_mode (str): Fractional-bit split policy:
+          ``importance`` or ``half``.
         turbo_sparse_v_tau (float, optional): Optional sparse-V threshold applied
           in fused TurboQuant decode attention. Default: ``None``.
         turbo_sparse_v_mode (str, optional): Sparse-V policy: ``fixed``,
@@ -638,6 +708,8 @@ def generate_step(
             turbo_estimator_mode=turbo_estimator_mode,
             turbo_qjl_residual=turbo_qjl_residual,
             turbo_qjl_projection_mode=turbo_qjl_projection_mode,
+            turbo_qjl_scale=turbo_qjl_scale,
+            turbo_fractional_split_mode=turbo_fractional_split_mode,
             turbo_sparse_v_tau=turbo_sparse_v_tau,
             turbo_sparse_v_mode=turbo_sparse_v_mode,
             turbo_sparse_v_percentile=turbo_sparse_v_percentile,
@@ -647,6 +719,9 @@ def generate_step(
             turbo_buffer_size=turbo_buffer_size,
             turbo_flush_batch_size=turbo_flush_batch_size,
             turbo_max_kv_size=turbo_max_kv_size,
+            turbo_codebook_override=turbo_codebook_override,
+            turbo_rotation_override=turbo_rotation_override,
+            turbo_deferred_quant=turbo_deferred_quant,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -668,6 +743,8 @@ def generate_step(
         turbo_estimator_mode=turbo_estimator_mode,
         turbo_qjl_residual=turbo_qjl_residual,
         turbo_qjl_projection_mode=turbo_qjl_projection_mode,
+        turbo_qjl_scale=turbo_qjl_scale,
+        turbo_fractional_split_mode=turbo_fractional_split_mode,
         turbo_sparse_v_tau=turbo_sparse_v_tau,
         turbo_sparse_v_mode=turbo_sparse_v_mode,
         turbo_sparse_v_percentile=turbo_sparse_v_percentile,
@@ -677,7 +754,19 @@ def generate_step(
         turbo_buffer_size=turbo_buffer_size,
         turbo_flush_batch_size=turbo_flush_batch_size,
         turbo_max_kv_size=turbo_max_kv_size,
+        turbo_codebook_override=turbo_codebook_override,
     )
+
+    # Apply TriAttention KV cache pruning if calibration provided
+    if triattention_calib is not None:
+        from .models.triattention import maybe_apply_triattention
+
+        maybe_apply_triattention(
+            prompt_cache,
+            model,
+            triattention_calib,
+            budget=triattention_budget,
+        )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -1824,6 +1913,34 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
+
+    # Codebook calibration / loading
+    codebook_override = None
+    rotation_override = None
+    if args.turbo_codebook_path is not None:
+        from .models.turboquant_calibrate import load_codebook
+
+        codebook_override, rotation_override = load_codebook(args.turbo_codebook_path)
+    elif (
+        args.turbo_calibrate is not None
+        and args.turbo_kv_bits is not None
+    ):
+        from .models.turboquant_calibrate import run_calibration
+
+        bits_set = {int(args.turbo_kv_bits)}
+        if args.turbo_key_bits:
+            bits_set.add(int(args.turbo_key_bits))
+        if args.turbo_value_bits:
+            bits_set.add(int(args.turbo_value_bits))
+        cal_tokens = mx.array(prompt[: args.turbo_calibrate])
+        codebook_override = run_calibration(
+            model,
+            tokenizer,
+            bits_list=sorted(bits_set),
+            tokens=cal_tokens,
+            rotation_mode=args.turbo_rotation_mode,
+        )
+
     response = generate(
         model,
         tokenizer,
@@ -1847,6 +1964,8 @@ def main():
         turbo_estimator_mode=args.turbo_estimator_mode,
         turbo_qjl_residual=not args.turbo_disable_qjl,
         turbo_qjl_projection_mode=args.turbo_qjl_projection_mode,
+        turbo_qjl_scale=args.turbo_qjl_scale,
+        turbo_fractional_split_mode=args.turbo_fractional_split_mode,
         turbo_sparse_v_tau=args.turbo_sparse_v_tau,
         turbo_sparse_v_mode=args.turbo_sparse_v_mode,
         turbo_sparse_v_percentile=args.turbo_sparse_v_percentile,
@@ -1856,6 +1975,11 @@ def main():
         turbo_buffer_size=args.turbo_buffer_size,
         turbo_flush_batch_size=args.turbo_flush_batch_size,
         turbo_max_kv_size=args.turbo_max_kv_size,
+        turbo_codebook_override=codebook_override,
+        turbo_rotation_override=rotation_override,
+        turbo_deferred_quant=args.turbo_deferred_quant,
+        triattention_calib=args.triattention_calib,
+        triattention_budget=args.triattention_budget,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )

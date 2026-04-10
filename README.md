@@ -457,6 +457,7 @@ claims transferred directly:
 | `tonbistudio/turboquant-pytorch` | strong separation between attention-score validation and **real text generation** validation; useful ablations around QJL and long context | PyTorch / CUDA speed claims do not say much by themselves about MLX runtime behavior |
 | `DeadByDawn101/turboquant-mlx` | a useful reminder that an implementation can have correct math on paper while still missing the live QJL wiring or compressed-domain attention kernel | README-level “implementation status” honesty is not a performance result |
 | `scrya-com/rotorquant` and `kpalastro/mlx_rotorquant` | rotor / fewer-parameter rotation design space, fused-kernel motivation, and why microkernel speed is worth chasing | RotorQuant has **not** yet replaced the exact TurboQuant winners on this branch |
+| `better-with-models/TinyQuant` | data-driven codebook calibration via uniform quantile estimation and Lloyd-Max iteration on real data; demonstrated that random-rotation + scalar quantization can benefit from empirical codebook training instead of assuming Gaussian | TinyQuant targets CPU embedding search (NumPy), not GPU KV-cache inference; its FP16 residual approach does not apply to our fused Metal pipeline |
 
 The practical rule we use in this repo is:
 

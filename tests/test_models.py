@@ -8,7 +8,11 @@ import mlx.nn as nn
 from mlx.utils import tree_map
 
 from mlx_lm.models import rope_utils
-from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
+from mlx_lm.models.base import (
+    create_attention_mask,
+    create_causal_mask,
+    scaled_dot_product_attention,
+)
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
@@ -1275,6 +1279,35 @@ class TestModels(unittest.TestCase):
             args.text_config["vocab_size"],
             args.text_config["num_hidden_layers"],
         )
+
+    def test_ouro_ut_norm_each_step(self):
+        from mlx_lm.models import ouro
+
+        args = ouro.ModelArgs(
+            model_type="ouro",
+            hidden_size=64,
+            num_hidden_layers=3,
+            intermediate_size=160,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=256,
+            head_dim=16,
+            total_ut_steps=2,
+            tie_word_embeddings=False,
+        )
+        model = ouro.Model(args)
+        tokens = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+        direct = model.model(tokens)
+        h = model.model.embed_tokens(tokens)
+        mask = create_attention_mask(h, None)
+        for _ in range(args.total_ut_steps):
+            for layer in model.model.layers:
+                h = layer(h, mask, None)
+            h = model.model.norm(h)
+
+        self.assertTrue(mx.allclose(direct, h, atol=1e-5, rtol=1e-5))
 
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode

@@ -202,8 +202,20 @@ def _cached_qjl_projection(dim, seed=123, mode="auto"):
     return projection, projection.T
 
 
-def _load_codebook(bits, dim):
+def _load_codebook(bits, dim, codebook_override=None):
     s = 1.0 / math.sqrt(dim)
+    if codebook_override is not None and bits in codebook_override:
+        cb = codebook_override[bits]
+        c = cb["centroids"]
+        b = cb["boundaries"]
+        if not isinstance(c, mx.array):
+            c = mx.array(c, dtype=mx.float32)
+        if not isinstance(b, mx.array):
+            b = mx.array(b, dtype=mx.float32)
+        # Calibrated codebooks are derived from actual unit-normalised rotated
+        # vectors whose per-coordinate scale is already ~1/sqrt(dim).  Do NOT
+        # apply the 1/sqrt(dim) factor again.
+        return c, b
     c = mx.array(_CENTROIDS[bits], dtype=mx.float32) * s
     b = mx.array(_BOUNDARIES[bits], dtype=mx.float32) * s
     return c, b
@@ -254,7 +266,11 @@ def _prefer_fused_default(
     return effective_key_bits == 3 and effective_value_bits == 4
 
 
-def _select_fractional_indices(keys, values, avg_bits):
+def _default_qjl_scale_coeff():
+    return math.sqrt(math.pi / 2.0)
+
+
+def _select_fractional_indices(keys, values, avg_bits, mode="importance"):
     lower_bits = math.floor(avg_bits)
     upper_bits = math.ceil(avg_bits)
     if lower_bits == upper_bits:
@@ -267,11 +283,19 @@ def _select_fractional_indices(keys, values, avg_bits):
     high_count = int(round((avg_bits - lower_bits) * dim / (upper_bits - lower_bits)))
     high_count = max(1, min(dim - 1, high_count))
 
-    scores = mx.mean(mx.abs(keys).astype(mx.float32), axis=(0, 1, 2))
-    scores = scores + mx.mean(mx.abs(values).astype(mx.float32), axis=(0, 1, 2))
-    mx.eval(scores)
-    order = np.argsort(np.asarray(scores))
-    high_idx = np.sort(order[-high_count:].astype(np.int32))
+    if mode == "half":
+        high_idx = np.arange(high_count, dtype=np.int32)
+    elif mode == "importance":
+        scores = mx.mean(mx.abs(keys).astype(mx.float32), axis=(0, 1, 2))
+        scores = scores + mx.mean(mx.abs(values).astype(mx.float32), axis=(0, 1, 2))
+        mx.eval(scores)
+        order = np.argsort(np.asarray(scores))
+        high_idx = np.sort(order[-high_count:].astype(np.int32))
+    else:
+        raise ValueError(
+            "fractional_split_mode must be 'importance' or 'half', "
+            f"got {mode}"
+        )
     low_mask = np.ones(dim, dtype=bool)
     low_mask[high_idx] = False
     low_idx = np.nonzero(low_mask)[0].astype(np.int32)
@@ -405,9 +429,10 @@ def _quantize_qjl_residual_packed(unit_vectors, mse_vectors, projection_t):
     return _pack(signs, 1), gamma
 
 
-def _dequantize_qjl(signs, gamma, projection):
+def _dequantize_qjl(signs, gamma, projection, qjl_scale_coeff=None):
     signs_pm = mx.where(signs > 0, 1.0, -1.0).astype(mx.float32)
-    scale = math.sqrt(math.pi / 2.0) / projection.shape[0]
+    coeff = _default_qjl_scale_coeff() if qjl_scale_coeff is None else float(qjl_scale_coeff)
+    scale = coeff / projection.shape[0]
     return scale * gamma.astype(mx.float32) * _apply_inverse_qjl_projection(
         signs_pm, projection
     )
@@ -448,9 +473,15 @@ def _dequantize_prod(
     gamma,
     projection,
     mode="dense",
+    qjl_scale_coeff=None,
 ):
     mse_vectors = _dequantize_unit(indices, rotation, centroids, mode=mode)
-    correction = _dequantize_qjl(qjl_signs, gamma, projection)
+    correction = _dequantize_qjl(
+        qjl_signs,
+        gamma,
+        projection,
+        qjl_scale_coeff=qjl_scale_coeff,
+    )
     return (mse_vectors + correction) * norms.astype(mx.float32)
 
 
@@ -794,10 +825,15 @@ class TurboQuantKVCache(_BaseCache):
         sparse_v_early_multiplier: float = 1.25,
         sparse_v_late_multiplier: float = 0.75,
         qjl_projection_mode: str = "auto",
+        qjl_scale: Optional[float] = None,
+        fractional_split_mode: str = "importance",
         decode_buffer: bool = False,
         buffer_size: int = 0,
         flush_batch_size: int = 0,
         max_cache_tokens: int = 0,
+        codebook_override=None,
+        rotation_override=None,
+        deferred_quant: bool = False,
     ):
         bits = _normalize_turbo_bits(bits)
         key_bits = _normalize_override_bits(key_bits, "key_bits")
@@ -822,6 +858,11 @@ class TurboQuantKVCache(_BaseCache):
                 "qjl_projection_mode must be 'auto', 'dense', or 'wht', "
                 f"got {qjl_projection_mode}"
             )
+        if fractional_split_mode not in ("importance", "half"):
+            raise ValueError(
+                "fractional_split_mode must be 'importance' or 'half', "
+                f"got {fractional_split_mode}"
+            )
         self.turbo_bits = bits
         self.key_bits_override = key_bits
         self.value_bits_override = value_bits
@@ -839,10 +880,20 @@ class TurboQuantKVCache(_BaseCache):
         self.sparse_v_early_multiplier = float(sparse_v_early_multiplier)
         self.sparse_v_late_multiplier = float(sparse_v_late_multiplier)
         self.qjl_projection_mode = qjl_projection_mode
+        self.qjl_scale = (
+            _default_qjl_scale_coeff() if qjl_scale is None else float(qjl_scale)
+        )
+        self.fractional_split_mode = fractional_split_mode
         self.decode_buffer = bool(decode_buffer)
         self.buffer_size = max(0, int(buffer_size))
         self.flush_batch_size = max(0, int(flush_batch_size or buffer_size))
         self.max_cache_tokens = max(0, int(max_cache_tokens))
+        self._codebook_override = codebook_override
+        self._rotation_override = rotation_override
+        self.deferred_quant = bool(deferred_quant)
+        self._deferred_phase = bool(deferred_quant)
+        self._deferred_buffer_keys = None
+        self._deferred_buffer_values = None
         self._qjl_projection_runtime_mode = None
         self.offset = 0
         self._packed_offset = 0
@@ -945,6 +996,18 @@ class TurboQuantKVCache(_BaseCache):
             self._v_indices = None
         if not hasattr(self, "_v_norms"):
             self._v_norms = None
+        if not hasattr(self, "_codebook_override"):
+            self._codebook_override = None
+        if not hasattr(self, "_rotation_override"):
+            self._rotation_override = None
+        if not hasattr(self, "deferred_quant"):
+            self.deferred_quant = False
+        if not hasattr(self, "_deferred_phase"):
+            self._deferred_phase = False
+        if not hasattr(self, "_deferred_buffer_keys"):
+            self._deferred_buffer_keys = None
+        if not hasattr(self, "_deferred_buffer_values"):
+            self._deferred_buffer_values = None
         if not hasattr(self, "_head_dim"):
             self._head_dim = None
         if not hasattr(self, "_value_dtype"):
@@ -977,6 +1040,10 @@ class TurboQuantKVCache(_BaseCache):
             )
         if not hasattr(self, "qjl_projection_mode"):
             self.qjl_projection_mode = "auto"
+        if not hasattr(self, "qjl_scale"):
+            self.qjl_scale = _default_qjl_scale_coeff()
+        if not hasattr(self, "fractional_split_mode"):
+            self.fractional_split_mode = "importance"
         if not hasattr(self, "_qjl_projection_runtime_mode"):
             self._qjl_projection_runtime_mode = None
 
@@ -994,14 +1061,21 @@ class TurboQuantKVCache(_BaseCache):
             else int(self.turbo_bits)
         )
         self._k_centroids, self._k_boundaries = _load_codebook(
-            self._k_bits, head_dim
+            self._k_bits, head_dim, codebook_override=self._codebook_override
         )
         self._v_centroids, self._v_boundaries = _load_codebook(
-            self._v_bits, head_dim
+            self._v_bits, head_dim, codebook_override=self._codebook_override
         )
-        self._rotation, self._rotation_t = _cached_rotation_pair(
-            head_dim, mode=self.rotation_mode
-        )
+        if self._rotation_override is not None:
+            rot = self._rotation_override
+            if not isinstance(rot, mx.array):
+                rot = mx.array(rot, dtype=mx.float32)
+            self._rotation = rot
+            self._rotation_t = rot.T
+        else:
+            self._rotation, self._rotation_t = _cached_rotation_pair(
+                head_dim, mode=self.rotation_mode
+            )
         if self.estimator_mode == "prod" and self.qjl_residual:
             resolved_qjl_mode = _resolve_qjl_projection_mode(
                 head_dim, self.qjl_projection_mode
@@ -1023,7 +1097,12 @@ class TurboQuantKVCache(_BaseCache):
             self._split_low_idx,
             self._split_high_idx,
             self._split_restore_order,
-        ) = _select_fractional_indices(keys, values, self.turbo_bits)
+        ) = _select_fractional_indices(
+            keys,
+            values,
+            self.turbo_bits,
+            mode=self.fractional_split_mode,
+        )
         self._split_low_cache = TurboQuantKVCache(
             bits=self._split_low_bits,
             rotation_mode=self.rotation_mode,
@@ -1031,10 +1110,15 @@ class TurboQuantKVCache(_BaseCache):
             qjl_residual=self.qjl_residual,
             sparse_v_tau=self.sparse_v_tau,
             qjl_projection_mode=self.qjl_projection_mode,
+            qjl_scale=self.qjl_scale,
+            fractional_split_mode=self.fractional_split_mode,
             decode_buffer=self.decode_buffer,
             buffer_size=self.buffer_size,
             flush_batch_size=self.flush_batch_size,
             max_cache_tokens=self.max_cache_tokens,
+            codebook_override=self._codebook_override,
+            rotation_override=self._rotation_override,
+            deferred_quant=self.deferred_quant,
         )
         self._split_high_cache = TurboQuantKVCache(
             bits=self._split_high_bits,
@@ -1043,10 +1127,15 @@ class TurboQuantKVCache(_BaseCache):
             qjl_residual=self.qjl_residual,
             sparse_v_tau=self.sparse_v_tau,
             qjl_projection_mode=self.qjl_projection_mode,
+            qjl_scale=self.qjl_scale,
+            fractional_split_mode=self.fractional_split_mode,
             decode_buffer=self.decode_buffer,
             buffer_size=self.buffer_size,
             flush_batch_size=self.flush_batch_size,
             max_cache_tokens=self.max_cache_tokens,
+            codebook_override=self._codebook_override,
+            rotation_override=self._rotation_override,
+            deferred_quant=self.deferred_quant,
         )
         # Fractional mode uses the existing integer cache logic as a safe
         # fallback and always materializes dequantized tensors for attention.
@@ -1296,11 +1385,22 @@ class TurboQuantKVCache(_BaseCache):
             )
         self._deq_alloc = alloc
 
+    def _adopt_decode_buffer(self, keys, values):
+        # Reuse the freshly produced K/V tensors directly and delay the first
+        # large copy until we actually need extra capacity during decode.
+        self._k_deq_buf = keys
+        self._v_deq_buf = values
+        self._deq_offset = keys.shape[2]
+        self._deq_alloc = self._deq_offset
+        return self._k_deq_buf, self._v_deq_buf
+
     def _materialize_decode_buffer(self, k_dtype, v_dtype):
         all_k = self._dequantize_keys(dtype=k_dtype)
         all_v = self._dequantize_values(dtype=v_dtype)
         if all_k is None or all_v is None:
             return all_k, all_v
+        if self._k_deq_buf is None and self._v_deq_buf is None:
+            return self._adopt_decode_buffer(all_k, all_v)
         batch_size, n_kv_heads, total, _ = all_k.shape
         self._ensure_decode_buffer_capacity(
             batch_size, n_kv_heads, total, k_dtype, v_dtype
@@ -1315,6 +1415,8 @@ class TurboQuantKVCache(_BaseCache):
             return None, None
         if self._v_deq_buf is not None and self._deq_offset != prev:
             return None, None
+        if prev == 0 and self._k_deq_buf is None and self._v_deq_buf is None:
+            return self._adopt_decode_buffer(keys, values)
 
         total = prev + keys.shape[2]
         batch_size = keys.shape[0]
@@ -1365,6 +1467,7 @@ class TurboQuantKVCache(_BaseCache):
                 k_gamma,
                 self._qjl_projection,
                 mode=self.rotation_mode,
+                qjl_scale_coeff=self.qjl_scale,
             )
         else:
             new_k = _dequantize(
@@ -1431,6 +1534,7 @@ class TurboQuantKVCache(_BaseCache):
                         self._k_qjl_gamma[..., :packed_limit, :],
                         self._qjl_projection,
                         mode=self.rotation_mode,
+                        qjl_scale_coeff=self.qjl_scale,
                     )
                 else:
                     keys = _dequantize(
@@ -1518,6 +1622,36 @@ class TurboQuantKVCache(_BaseCache):
             if values.dtype != dv.dtype:
                 dv = dv.astype(values.dtype)
             return mx.contiguous(dk), mx.contiguous(dv)
+
+        # Deferred quantization: buffer during prefill, compress on first decode
+        if self.deferred_quant and self._deferred_phase:
+            _, _, num_steps, head_dim = keys.shape
+            self._value_dtype = values.dtype
+            if self._k_centroids is None:
+                self._init_codebook(head_dim)
+            if self._deferred_buffer_keys is None:
+                self._deferred_buffer_keys = keys
+                self._deferred_buffer_values = values
+            else:
+                self._deferred_buffer_keys = mx.concatenate(
+                    [self._deferred_buffer_keys, keys], axis=2
+                )
+                self._deferred_buffer_values = mx.concatenate(
+                    [self._deferred_buffer_values, values], axis=2
+                )
+            self.offset = self._deferred_buffer_keys.shape[2]
+            if num_steps == 1:
+                self._deferred_phase = False
+                buf_k = self._deferred_buffer_keys
+                buf_v = self._deferred_buffer_values
+                self._deferred_buffer_keys = None
+                self._deferred_buffer_values = None
+                self.offset = 0
+                self._compress_store(buf_k, buf_v)
+                all_k = self._dequantize_keys(dtype=keys.dtype)
+                all_v = self._dequantize_values(dtype=values.dtype)
+                return mx.contiguous(all_k), mx.contiguous(all_v)
+            return self._deferred_buffer_keys, self._deferred_buffer_values
 
         if self._supports_recent_buffer():
             _, _, num_steps, head_dim = keys.shape
@@ -1899,7 +2033,7 @@ class TurboQuantKVCache(_BaseCache):
         q_proj = _apply_qjl_projection(q_model, self._qjl_projection_t)
         q_proj = _fused_input(mx.reshape(q_proj, (B, Hkv, n_repeats, D)), mx.float32)
         qjl_scale = mx.array(
-            [math.sqrt(math.pi / 2.0) / D],
+            [self.qjl_scale / D],
             dtype=mx.float32,
         )
         corr_scores = _metal_qjl_score(
@@ -2122,6 +2256,8 @@ class TurboQuantKVCache(_BaseCache):
                 "-" if self.value_bits_override is None else str(self.value_bits_override),
                 "1" if self.qjl_residual else "0",
                 str(self.max_cache_tokens),
+                str(float(self.qjl_scale)),
+                self.fractional_split_mode,
                 "split",
                 low_meta,
                 high_meta,
@@ -2144,6 +2280,8 @@ class TurboQuantKVCache(_BaseCache):
                     "-" if self.value_bits_override is None else self.value_bits_override,
                     "1" if self.qjl_residual else "0",
                     self.max_cache_tokens,
+                    float(self.qjl_scale),
+                    self.fractional_split_mode,
                 ),
             )
         )
@@ -2210,6 +2348,18 @@ class TurboQuantKVCache(_BaseCache):
             next_idx += 1
         else:
             self.max_cache_tokens = 0
+        if len(v) > next_idx and v[next_idx] != "split":
+            self.qjl_scale = float(v[next_idx])
+            next_idx += 1
+        else:
+            self.qjl_scale = _default_qjl_scale_coeff()
+        if len(v) > next_idx and v[next_idx] != "split":
+            self.fractional_split_mode = v[next_idx]
+            next_idx += 1
+        else:
+            self.fractional_split_mode = "importance"
+        if self.fractional_split_mode not in ("importance", "half"):
+            self.fractional_split_mode = "importance"
         self._qjl_projection_runtime_mode = None
         self._fractional_split = len(v) > next_idx and v[next_idx] == "split"
         self._fused_enabled = os.environ.get("MLX_TQ_FUSED", "0").lower() not in (
