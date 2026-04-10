@@ -236,6 +236,18 @@ def setup_arg_parser():
         help="[Experimental] Path to a .safetensors file with calibrated "
         "TurboQuant codebooks. See mlx_lm.calibrate_turboquant.",
     )
+    parser.add_argument(
+        "--triattention-calib",
+        type=str,
+        default=None,
+        help="[Experimental] Path to TriAttention calibration .safetensors.",
+    )
+    parser.add_argument(
+        "--triattention-budget",
+        type=int,
+        default=2048,
+        help="[Experimental] Max KV tokens to retain after TriAttention pruning.",
+    )
     return parser
 
 
@@ -335,6 +347,8 @@ def main():
             turbo_flush_batch_size=args.turbo_flush_batch_size,
             turbo_max_kv_size=args.turbo_max_kv_size,
             turbo_codebook_override=codebook_override,
+            triattention_calib=args.triattention_calib,
+            triattention_budget=args.triattention_budget,
         ):
             pass
         return response

@@ -373,6 +373,20 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--triattention-calib",
+        type=str,
+        default=None,
+        help="[Experimental] Path to TriAttention calibration .safetensors "
+        "file. Enables trigonometric KV cache pruning (arXiv:2604.04921).",
+    )
+    parser.add_argument(
+        "--triattention-budget",
+        type=int,
+        default=2048,
+        help="[Experimental] Maximum KV tokens to retain after TriAttention "
+        "compression. Default: 2048.",
+    )
     return parser
 
 
@@ -566,6 +580,8 @@ def generate_step(
     turbo_flush_batch_size: int = 0,
     turbo_max_kv_size: int = 0,
     turbo_codebook_override=None,
+    triattention_calib: Optional[str] = None,
+    triattention_budget: int = 2048,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -725,6 +741,17 @@ def generate_step(
         turbo_max_kv_size=turbo_max_kv_size,
         turbo_codebook_override=turbo_codebook_override,
     )
+
+    # Apply TriAttention KV cache pruning if calibration provided
+    if triattention_calib is not None:
+        from .models.triattention import maybe_apply_triattention
+
+        maybe_apply_triattention(
+            prompt_cache,
+            model,
+            triattention_calib,
+            budget=triattention_budget,
+        )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -1933,6 +1960,8 @@ def main():
         turbo_flush_batch_size=args.turbo_flush_batch_size,
         turbo_max_kv_size=args.turbo_max_kv_size,
         turbo_codebook_override=codebook_override,
+        triattention_calib=args.triattention_calib,
+        triattention_budget=args.triattention_budget,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
