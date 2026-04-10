@@ -36,6 +36,8 @@ def make_prompt_cache(
     turbo_flush_batch_size: int = 0,
     turbo_max_kv_size: int = 0,
     turbo_codebook_override=None,
+    turbo_rotation_override=None,
+    turbo_deferred_quant: bool = False,
     rotor_kv_bits: Optional[float] = None,
     rotor_fp16_layers: int = 1,
     rotor_estimator_mode: str = "mse",
@@ -136,6 +138,8 @@ def make_prompt_cache(
             flush_batch_size=turbo_flush_batch_size,
             max_cache_tokens=turbo_max_kv_size,
             codebook_override=turbo_codebook_override,
+            rotation_override=turbo_rotation_override,
+            deferred_quant=turbo_deferred_quant,
         )
 
     def _to_rotorquant(cache_obj):
@@ -850,6 +854,8 @@ class KVCache(_BaseCache):
         flush_batch_size: int = 0,
         max_cache_tokens: int = 0,
         codebook_override=None,
+        rotation_override=None,
+        deferred_quant: bool = False,
     ):
         """Convert to TurboQuant compressed cache (experimental).
 
@@ -919,6 +925,8 @@ class KVCache(_BaseCache):
             flush_batch_size=flush_batch_size,
             max_cache_tokens=max_cache_tokens,
             codebook_override=codebook_override,
+            rotation_override=rotation_override,
+            deferred_quant=deferred_quant,
         )
         if self.keys is not None:
             tq_cache.update_and_fetch(

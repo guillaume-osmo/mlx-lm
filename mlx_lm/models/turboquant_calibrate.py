@@ -192,6 +192,74 @@ def collect_rotated_samples(
     return combined.astype(np.float32)
 
 
+def collect_raw_samples(
+    model: nn.Module,
+    tokenizer,
+    tokens: mx.array,
+    max_samples: int = 500_000,
+    prefill_step_size: int = 512,
+) -> np.ndarray:
+    """Collect raw (un-rotated) unit-normalised KV coordinates for SVD calibration."""
+    cache = make_prompt_cache(model)
+
+    tokens_1d = tokens.reshape(-1)
+    T = tokens_1d.shape[0]
+    for start in range(0, T, prefill_step_size):
+        end = min(start + prefill_step_size, T)
+        chunk = tokens_1d[start:end][None]
+        model(chunk, cache=cache)
+        mx.eval([c.state for c in cache if hasattr(c, "state")])
+
+    all_samples: List[np.ndarray] = []
+
+    for layer_cache in cache:
+        if not isinstance(layer_cache, KVCache):
+            continue
+        for tensor in (layer_cache.keys, layer_cache.values):
+            if tensor is None:
+                continue
+            t = tensor[..., : layer_cache.offset, :]
+            if t.size == 0:
+                continue
+
+            t_f = t.astype(mx.float32)
+            norms = mx.linalg.norm(t_f, axis=-1, keepdims=True)
+            unit = t_f / mx.maximum(norms, 1e-8)
+            mx.eval(unit)
+
+            flat = np.asarray(unit).reshape(-1, unit.shape[-1])
+            all_samples.append(flat)
+
+    if not all_samples:
+        raise RuntimeError("No KV-cache samples collected")
+
+    combined = np.concatenate(all_samples)
+    if combined.shape[0] > max_samples:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(combined.shape[0], size=max_samples, replace=False)
+        combined = combined[idx]
+
+    return combined.astype(np.float32)
+
+
+def calibrate_svd_rotation(samples: np.ndarray) -> np.ndarray:
+    """Compute SVD-based rotation matrix from raw KV samples (TurboESM approach).
+
+    Aligns with principal components of actual KV data distribution.
+
+    Args:
+        samples: 2-D ``[N, head_dim]`` raw unit-normalised KV coordinates.
+
+    Returns:
+        Rotation matrix ``Vt`` of shape ``[head_dim, head_dim]``.
+    """
+    X = samples.astype(np.float64)
+    X -= X.mean(axis=0)
+    cov = (X.T @ X) / max(X.shape[0] - 1, 1)
+    _, _, Vt = np.linalg.svd(cov)
+    return Vt.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -241,13 +309,12 @@ def run_calibration(
 # Persistence (safetensors)
 # ---------------------------------------------------------------------------
 
-def save_codebook(codebook_dict: Dict[int, Dict[str, np.ndarray]], path: str) -> None:
-    """Save calibrated codebooks to a ``.safetensors`` file.
-
-    Args:
-        codebook_dict: Output of ``run_calibration``.
-        path: Destination file path (should end in ``.safetensors``).
-    """
+def save_codebook(
+    codebook_dict: Dict[int, Dict[str, np.ndarray]],
+    path: str,
+    rotation_matrix: Optional[np.ndarray] = None,
+) -> None:
+    """Save calibrated codebooks (and optional SVD rotation) to safetensors."""
     tensors = {}
     bits_present = []
     for bits, cb in codebook_dict.items():
@@ -259,26 +326,27 @@ def save_codebook(codebook_dict: Dict[int, Dict[str, np.ndarray]], path: str) ->
         "format": "turboquant_codebook_v1",
         "bits": ",".join(sorted(bits_present)),
     }
+
+    if rotation_matrix is not None:
+        tensors["svd_rotation"] = mx.array(rotation_matrix, dtype=mx.float32)
+        metadata["has_rotation"] = "true"
+
     mx.save_safetensors(path, tensors, metadata=metadata)
 
 
-def load_codebook(path: str) -> Dict[int, Dict[str, np.ndarray]]:
-    """Load calibrated codebooks from a ``.safetensors`` file.
-
-    Args:
-        path: Source file path.
+def load_codebook(path: str) -> Tuple[Dict[int, Dict[str, np.ndarray]], Optional[np.ndarray]]:
+    """Load calibrated codebooks (and optional SVD rotation) from safetensors.
 
     Returns:
-        Dict mapping bit-width to ``{"centroids": np.array,
-        "boundaries": np.array}``.
+        Tuple of (codebook_dict, rotation_matrix).  ``rotation_matrix`` is
+        ``None`` when the file does not contain an SVD rotation.
     """
     tensors, metadata = mx.load(path, return_metadata=True)
     if not isinstance(tensors, dict):
-        raise ValueError(f"Expected dict from {path}, got {type(tensors)}")
+        raise ValueError(f"Expected dict from {path}")
 
     bits_str = metadata.get("bits", "")
     if not bits_str:
-        # Infer from tensor keys.
         bits_set = set()
         for key in tensors:
             if key.startswith("centroids_"):
@@ -292,20 +360,22 @@ def load_codebook(path: str) -> Dict[int, Dict[str, np.ndarray]]:
         c_key = f"centroids_{bits}"
         b_key = f"boundaries_{bits}"
         if c_key not in tensors or b_key not in tensors:
-            raise ValueError(
-                f"Missing {c_key} or {b_key} in codebook file {path}"
-            )
+            raise ValueError(f"Missing {c_key} or {b_key} in {path}")
         c = np.array(tensors[c_key])
         b = np.array(tensors[b_key])
         expected_entries = 1 << bits
         if c.shape != (expected_entries,):
             raise ValueError(
-                f"centroids_{bits} has shape {c.shape}, expected ({expected_entries},)"
+                f"centroids_{bits} shape {c.shape}, expected ({expected_entries},)"
             )
         if b.shape != (expected_entries + 1,):
             raise ValueError(
-                f"boundaries_{bits} has shape {b.shape}, expected ({expected_entries + 1},)"
+                f"boundaries_{bits} shape {b.shape}, expected ({expected_entries + 1},)"
             )
         result[bits] = {"centroids": c, "boundaries": b}
 
-    return result
+    rotation = None
+    if "svd_rotation" in tensors:
+        rotation = np.array(tensors["svd_rotation"])
+
+    return result, rotation

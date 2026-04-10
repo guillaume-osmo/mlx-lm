@@ -362,6 +362,13 @@ def setup_arg_parser():
         "TurboQuant codebooks. See mlx_lm.calibrate_turboquant.",
     )
     parser.add_argument(
+        "--turbo-deferred-quant",
+        action="store_true",
+        default=False,
+        help="[Experimental] Keep KV in FP16 during prefill, compress only "
+        "at decode time. Avoids error compounding during prompt processing.",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -516,6 +523,8 @@ def maybe_turboquant_kv_cache(
     turbo_flush_batch_size: int = 0,
     turbo_max_kv_size: int = 0,
     turbo_codebook_override=None,
+    turbo_rotation_override=None,
+    turbo_deferred_quant: bool = False,
 ):
     """Convert KV caches to TurboQuant compression (experimental)."""
     if turbo_kv_bits is None:
@@ -542,6 +551,8 @@ def maybe_turboquant_kv_cache(
                 flush_batch_size=turbo_flush_batch_size,
                 max_cache_tokens=turbo_max_kv_size,
                 codebook_override=turbo_codebook_override,
+                rotation_override=turbo_rotation_override,
+                deferred_quant=turbo_deferred_quant,
             )
 
 
@@ -580,6 +591,8 @@ def generate_step(
     turbo_flush_batch_size: int = 0,
     turbo_max_kv_size: int = 0,
     turbo_codebook_override=None,
+    turbo_rotation_override=None,
+    turbo_deferred_quant: bool = False,
     triattention_calib: Optional[str] = None,
     triattention_budget: int = 2048,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
@@ -707,6 +720,8 @@ def generate_step(
             turbo_flush_batch_size=turbo_flush_batch_size,
             turbo_max_kv_size=turbo_max_kv_size,
             turbo_codebook_override=turbo_codebook_override,
+            turbo_rotation_override=turbo_rotation_override,
+            turbo_deferred_quant=turbo_deferred_quant,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -1901,10 +1916,11 @@ def main():
 
     # Codebook calibration / loading
     codebook_override = None
+    rotation_override = None
     if args.turbo_codebook_path is not None:
         from .models.turboquant_calibrate import load_codebook
 
-        codebook_override = load_codebook(args.turbo_codebook_path)
+        codebook_override, rotation_override = load_codebook(args.turbo_codebook_path)
     elif (
         args.turbo_calibrate is not None
         and args.turbo_kv_bits is not None
@@ -1960,6 +1976,8 @@ def main():
         turbo_flush_batch_size=args.turbo_flush_batch_size,
         turbo_max_kv_size=args.turbo_max_kv_size,
         turbo_codebook_override=codebook_override,
+        turbo_rotation_override=rotation_override,
+        turbo_deferred_quant=args.turbo_deferred_quant,
         triattention_calib=args.triattention_calib,
         triattention_budget=args.triattention_budget,
         draft_model=draft_model,

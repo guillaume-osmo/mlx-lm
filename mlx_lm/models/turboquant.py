@@ -832,6 +832,8 @@ class TurboQuantKVCache(_BaseCache):
         flush_batch_size: int = 0,
         max_cache_tokens: int = 0,
         codebook_override=None,
+        rotation_override=None,
+        deferred_quant: bool = False,
     ):
         bits = _normalize_turbo_bits(bits)
         key_bits = _normalize_override_bits(key_bits, "key_bits")
@@ -887,6 +889,11 @@ class TurboQuantKVCache(_BaseCache):
         self.flush_batch_size = max(0, int(flush_batch_size or buffer_size))
         self.max_cache_tokens = max(0, int(max_cache_tokens))
         self._codebook_override = codebook_override
+        self._rotation_override = rotation_override
+        self.deferred_quant = bool(deferred_quant)
+        self._deferred_phase = bool(deferred_quant)
+        self._deferred_buffer_keys = None
+        self._deferred_buffer_values = None
         self._qjl_projection_runtime_mode = None
         self.offset = 0
         self._packed_offset = 0
@@ -991,6 +998,16 @@ class TurboQuantKVCache(_BaseCache):
             self._v_norms = None
         if not hasattr(self, "_codebook_override"):
             self._codebook_override = None
+        if not hasattr(self, "_rotation_override"):
+            self._rotation_override = None
+        if not hasattr(self, "deferred_quant"):
+            self.deferred_quant = False
+        if not hasattr(self, "_deferred_phase"):
+            self._deferred_phase = False
+        if not hasattr(self, "_deferred_buffer_keys"):
+            self._deferred_buffer_keys = None
+        if not hasattr(self, "_deferred_buffer_values"):
+            self._deferred_buffer_values = None
         if not hasattr(self, "_head_dim"):
             self._head_dim = None
         if not hasattr(self, "_value_dtype"):
@@ -1049,9 +1066,16 @@ class TurboQuantKVCache(_BaseCache):
         self._v_centroids, self._v_boundaries = _load_codebook(
             self._v_bits, head_dim, codebook_override=self._codebook_override
         )
-        self._rotation, self._rotation_t = _cached_rotation_pair(
-            head_dim, mode=self.rotation_mode
-        )
+        if self._rotation_override is not None:
+            rot = self._rotation_override
+            if not isinstance(rot, mx.array):
+                rot = mx.array(rot, dtype=mx.float32)
+            self._rotation = rot
+            self._rotation_t = rot.T
+        else:
+            self._rotation, self._rotation_t = _cached_rotation_pair(
+                head_dim, mode=self.rotation_mode
+            )
         if self.estimator_mode == "prod" and self.qjl_residual:
             resolved_qjl_mode = _resolve_qjl_projection_mode(
                 head_dim, self.qjl_projection_mode
@@ -1093,6 +1117,8 @@ class TurboQuantKVCache(_BaseCache):
             flush_batch_size=self.flush_batch_size,
             max_cache_tokens=self.max_cache_tokens,
             codebook_override=self._codebook_override,
+            rotation_override=self._rotation_override,
+            deferred_quant=self.deferred_quant,
         )
         self._split_high_cache = TurboQuantKVCache(
             bits=self._split_high_bits,
@@ -1108,6 +1134,8 @@ class TurboQuantKVCache(_BaseCache):
             flush_batch_size=self.flush_batch_size,
             max_cache_tokens=self.max_cache_tokens,
             codebook_override=self._codebook_override,
+            rotation_override=self._rotation_override,
+            deferred_quant=self.deferred_quant,
         )
         # Fractional mode uses the existing integer cache logic as a safe
         # fallback and always materializes dequantized tensors for attention.
@@ -1594,6 +1622,36 @@ class TurboQuantKVCache(_BaseCache):
             if values.dtype != dv.dtype:
                 dv = dv.astype(values.dtype)
             return mx.contiguous(dk), mx.contiguous(dv)
+
+        # Deferred quantization: buffer during prefill, compress on first decode
+        if self.deferred_quant and self._deferred_phase:
+            _, _, num_steps, head_dim = keys.shape
+            self._value_dtype = values.dtype
+            if self._k_centroids is None:
+                self._init_codebook(head_dim)
+            if self._deferred_buffer_keys is None:
+                self._deferred_buffer_keys = keys
+                self._deferred_buffer_values = values
+            else:
+                self._deferred_buffer_keys = mx.concatenate(
+                    [self._deferred_buffer_keys, keys], axis=2
+                )
+                self._deferred_buffer_values = mx.concatenate(
+                    [self._deferred_buffer_values, values], axis=2
+                )
+            self.offset = self._deferred_buffer_keys.shape[2]
+            if num_steps == 1:
+                self._deferred_phase = False
+                buf_k = self._deferred_buffer_keys
+                buf_v = self._deferred_buffer_values
+                self._deferred_buffer_keys = None
+                self._deferred_buffer_values = None
+                self.offset = 0
+                self._compress_store(buf_k, buf_v)
+                all_k = self._dequantize_keys(dtype=keys.dtype)
+                all_v = self._dequantize_values(dtype=values.dtype)
+                return mx.contiguous(all_k), mx.contiguous(all_v)
+            return self._deferred_buffer_keys, self._deferred_buffer_values
 
         if self._supports_recent_buffer():
             _, _, num_steps, head_dim = keys.shape

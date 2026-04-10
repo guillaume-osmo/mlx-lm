@@ -248,6 +248,12 @@ def setup_arg_parser():
         default=2048,
         help="[Experimental] Max KV tokens to retain after TriAttention pruning.",
     )
+    parser.add_argument(
+        "--turbo-deferred-quant",
+        action="store_true",
+        default=False,
+        help="[Experimental] Keep KV in FP16 during prefill, compress at decode.",
+    )
     return parser
 
 
@@ -291,10 +297,11 @@ def main():
 
     # Codebook calibration / loading
     codebook_override = None
+    rotation_override = None
     if args.turbo_codebook_path is not None:
         from mlx_lm.models.turboquant_calibrate import load_codebook
 
-        codebook_override = load_codebook(args.turbo_codebook_path)
+        codebook_override, rotation_override = load_codebook(args.turbo_codebook_path)
     elif (
         args.turbo_calibrate is not None
         and args.turbo_kv_bits is not None
@@ -347,6 +354,8 @@ def main():
             turbo_flush_batch_size=args.turbo_flush_batch_size,
             turbo_max_kv_size=args.turbo_max_kv_size,
             turbo_codebook_override=codebook_override,
+            turbo_rotation_override=rotation_override,
+            turbo_deferred_quant=args.turbo_deferred_quant,
             triattention_calib=args.triattention_calib,
             triattention_budget=args.triattention_budget,
         ):
