@@ -24,6 +24,8 @@ def make_prompt_cache(
     turbo_estimator_mode: str = "mse",
     turbo_qjl_residual: bool = True,
     turbo_qjl_projection_mode: str = "auto",
+    turbo_qjl_scale: Optional[float] = None,
+    turbo_fractional_split_mode: str = "importance",
     turbo_sparse_v_tau: Optional[float] = None,
     turbo_sparse_v_mode: Optional[str] = None,
     turbo_sparse_v_percentile: Optional[float] = None,
@@ -33,6 +35,7 @@ def make_prompt_cache(
     turbo_buffer_size: int = 0,
     turbo_flush_batch_size: int = 0,
     turbo_max_kv_size: int = 0,
+    turbo_codebook_override=None,
     rotor_kv_bits: Optional[float] = None,
     rotor_fp16_layers: int = 1,
     rotor_estimator_mode: str = "mse",
@@ -69,6 +72,10 @@ def make_prompt_cache(
             TurboQuant keys when using ``prod`` mode.
         turbo_qjl_projection_mode (str): TurboQuant QJL projection backend for
             ``prod`` mode.
+        turbo_qjl_scale (Optional[float]): Override the QJL score correction
+            coefficient. ``None`` keeps the theoretical default.
+        turbo_fractional_split_mode (str): Fractional-bit split policy:
+            ``importance`` or ``half``.
         turbo_sparse_v_tau (Optional[float]): Optional sparse-V threshold for
             TurboQuant fused decode attention.
         turbo_sparse_v_mode (Optional[str]): Sparse-V policy: ``fixed``,
@@ -116,16 +123,19 @@ def make_prompt_cache(
             rotation_mode=turbo_rotation_mode,
             estimator_mode=turbo_estimator_mode,
             qjl_residual=turbo_qjl_residual,
+            qjl_scale=turbo_qjl_scale,
             sparse_v_tau=turbo_sparse_v_tau,
             sparse_v_mode=turbo_sparse_v_mode,
             sparse_v_percentile=turbo_sparse_v_percentile,
             sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
             sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
             qjl_projection_mode=turbo_qjl_projection_mode,
+            fractional_split_mode=turbo_fractional_split_mode,
             decode_buffer=turbo_decode_buffer,
             buffer_size=turbo_buffer_size,
             flush_batch_size=turbo_flush_batch_size,
             max_cache_tokens=turbo_max_kv_size,
+            codebook_override=turbo_codebook_override,
         )
 
     def _to_rotorquant(cache_obj):
@@ -209,16 +219,19 @@ def make_prompt_cache(
                             rotation_mode=turbo_rotation_mode,
                             estimator_mode=turbo_estimator_mode,
                             qjl_residual=turbo_qjl_residual,
+                            qjl_scale=turbo_qjl_scale,
                             sparse_v_tau=turbo_sparse_v_tau,
                             sparse_v_mode=turbo_sparse_v_mode,
                             sparse_v_percentile=turbo_sparse_v_percentile,
                             sparse_v_early_multiplier=turbo_sparse_v_early_multiplier,
                             sparse_v_late_multiplier=turbo_sparse_v_late_multiplier,
                             qjl_projection_mode=turbo_qjl_projection_mode,
+                            fractional_split_mode=turbo_fractional_split_mode,
                             decode_buffer=turbo_decode_buffer,
                             buffer_size=turbo_buffer_size,
                             flush_batch_size=turbo_flush_batch_size,
                             max_cache_tokens=turbo_max_kv_size,
+                            codebook_override=turbo_codebook_override,
                         )
                     )
             return _annotate_layers(caches)
@@ -824,16 +837,19 @@ class KVCache(_BaseCache):
         rotation_mode: str = "dense",
         estimator_mode: str = "mse",
         qjl_residual: bool = True,
+        qjl_scale: Optional[float] = None,
         sparse_v_tau: Optional[float] = None,
         sparse_v_mode: Optional[str] = None,
         sparse_v_percentile: Optional[float] = None,
         sparse_v_early_multiplier: float = 1.25,
         sparse_v_late_multiplier: float = 0.75,
         qjl_projection_mode: str = "auto",
+        fractional_split_mode: str = "importance",
         decode_buffer: bool = False,
         buffer_size: int = 0,
         flush_batch_size: int = 0,
         max_cache_tokens: int = 0,
+        codebook_override=None,
     ):
         """Convert to TurboQuant compressed cache (experimental).
 
@@ -855,6 +871,8 @@ class KVCache(_BaseCache):
                 bits plus a packed 1-bit QJL residual correction.
             qjl_residual (bool): Enable the 1-bit QJL residual correction on
                 keys when using ``prod`` mode.
+            qjl_scale (Optional[float]): Override the QJL score correction
+                coefficient. ``None`` keeps the theoretical default.
             sparse_v_tau (Optional[float]): Optional threshold for sparse-V gating
                 during fused decode attention.
             sparse_v_mode (Optional[str]): Sparse-V policy: ``fixed``,
@@ -867,6 +885,8 @@ class KVCache(_BaseCache):
                 the last layer.
             qjl_projection_mode (str): QJL projection backend for ``prod`` mode:
                 ``auto``, ``dense``, or ``wht``.
+            fractional_split_mode (str): Fractional-bit split policy:
+                ``importance`` or ``half``.
             decode_buffer (bool): Keep a running dequantized K/V decode buffer
                 for incremental decode instead of relying on the packed fused
                 attention path.
@@ -886,16 +906,19 @@ class KVCache(_BaseCache):
             rotation_mode=rotation_mode,
             estimator_mode=estimator_mode,
             qjl_residual=qjl_residual,
+            qjl_scale=qjl_scale,
             sparse_v_tau=sparse_v_tau,
             sparse_v_mode=sparse_v_mode,
             sparse_v_percentile=sparse_v_percentile,
             sparse_v_early_multiplier=sparse_v_early_multiplier,
             sparse_v_late_multiplier=sparse_v_late_multiplier,
             qjl_projection_mode=qjl_projection_mode,
+            fractional_split_mode=fractional_split_mode,
             decode_buffer=decode_buffer,
             buffer_size=buffer_size,
             flush_batch_size=flush_batch_size,
             max_cache_tokens=max_cache_tokens,
+            codebook_override=codebook_override,
         )
         if self.keys is not None:
             tq_cache.update_and_fetch(
@@ -912,12 +935,14 @@ class KVCache(_BaseCache):
         rotation_mode: str = "dense",
         estimator_mode: str = "mse",
         qjl_residual: bool = True,
+        qjl_scale: Optional[float] = None,
         sparse_v_tau: Optional[float] = None,
         sparse_v_mode: Optional[str] = None,
         sparse_v_percentile: Optional[float] = None,
         sparse_v_early_multiplier: float = 1.25,
         sparse_v_late_multiplier: float = 0.75,
         qjl_projection_mode: str = "auto",
+        fractional_split_mode: str = "importance",
         decode_buffer: bool = False,
         buffer_size: int = 0,
         flush_batch_size: int = 0,
@@ -931,12 +956,14 @@ class KVCache(_BaseCache):
             rotation_mode=rotation_mode,
             estimator_mode=estimator_mode,
             qjl_residual=qjl_residual,
+            qjl_scale=qjl_scale,
             sparse_v_tau=sparse_v_tau,
             sparse_v_mode=sparse_v_mode,
             sparse_v_percentile=sparse_v_percentile,
             sparse_v_early_multiplier=sparse_v_early_multiplier,
             sparse_v_late_multiplier=sparse_v_late_multiplier,
             qjl_projection_mode=qjl_projection_mode,
+            fractional_split_mode=fractional_split_mode,
             decode_buffer=decode_buffer,
             buffer_size=buffer_size,
             flush_batch_size=flush_batch_size,

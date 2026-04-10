@@ -150,6 +150,19 @@ def setup_arg_parser():
         help="[Experimental] TurboQuant QJL projection backend for 'prod' mode.",
     )
     parser.add_argument(
+        "--turbo-qjl-scale",
+        type=float,
+        default=None,
+        help="[Experimental] Override the TurboQuant QJL score correction coefficient.",
+    )
+    parser.add_argument(
+        "--turbo-fractional-split-mode",
+        type=str,
+        choices=["importance", "half"],
+        default="importance",
+        help="[Experimental] Channel split policy for fractional TurboQuant bit-widths.",
+    )
+    parser.add_argument(
         "--turbo-disable-qjl",
         action="store_true",
         help="[Experimental] Disable the 1-bit QJL residual correction in TurboQuant prod mode.",
@@ -208,6 +221,21 @@ def setup_arg_parser():
         default=0,
         help="[Experimental] Keep at most this many TurboQuant tokens by evicting the oldest compressed tokens.",
     )
+    parser.add_argument(
+        "--turbo-calibrate",
+        type=int,
+        default=None,
+        help="[Experimental] Run codebook calibration using the first N tokens "
+        "of the prompt. Replaces Gaussian codebooks with data-driven "
+        "quantile-estimated codebooks.",
+    )
+    parser.add_argument(
+        "--turbo-codebook-path",
+        type=str,
+        default=None,
+        help="[Experimental] Path to a .safetensors file with calibrated "
+        "TurboQuant codebooks. See mlx_lm.calibrate_turboquant.",
+    )
     return parser
 
 
@@ -249,6 +277,32 @@ def main():
     prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
     prompt = prompts[0]
 
+    # Codebook calibration / loading
+    codebook_override = None
+    if args.turbo_codebook_path is not None:
+        from mlx_lm.models.turboquant_calibrate import load_codebook
+
+        codebook_override = load_codebook(args.turbo_codebook_path)
+    elif (
+        args.turbo_calibrate is not None
+        and args.turbo_kv_bits is not None
+    ):
+        from mlx_lm.models.turboquant_calibrate import run_calibration
+
+        bits_set = {int(args.turbo_kv_bits)}
+        if args.turbo_key_bits:
+            bits_set.add(int(args.turbo_key_bits))
+        if args.turbo_value_bits:
+            bits_set.add(int(args.turbo_value_bits))
+        cal_tokens = mx.array(prompt[: args.turbo_calibrate])
+        codebook_override = run_calibration(
+            model,
+            tokenizer,
+            bits_list=sorted(bits_set),
+            tokens=cal_tokens,
+            rotation_mode=args.turbo_rotation_mode,
+        )
+
     def single_bench():
         for response in stream_generate(
             model,
@@ -269,6 +323,8 @@ def main():
             turbo_estimator_mode=args.turbo_estimator_mode,
             turbo_qjl_residual=not args.turbo_disable_qjl,
             turbo_qjl_projection_mode=args.turbo_qjl_projection_mode,
+            turbo_qjl_scale=args.turbo_qjl_scale,
+            turbo_fractional_split_mode=args.turbo_fractional_split_mode,
             turbo_sparse_v_tau=args.turbo_sparse_v_tau,
             turbo_sparse_v_mode=args.turbo_sparse_v_mode,
             turbo_sparse_v_percentile=args.turbo_sparse_v_percentile,
@@ -278,6 +334,7 @@ def main():
             turbo_buffer_size=args.turbo_buffer_size,
             turbo_flush_batch_size=args.turbo_flush_batch_size,
             turbo_max_kv_size=args.turbo_max_kv_size,
+            turbo_codebook_override=codebook_override,
         ):
             pass
         return response

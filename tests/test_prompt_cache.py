@@ -37,6 +37,7 @@ from mlx_lm.models.turboquant import (
     _apply_rotation,
     _cached_rotation_pair,
     _cached_qjl_projection,
+    _dequantize_qjl,
     _metal_available,
     _metal_qjl_score,
     _pack,
@@ -782,6 +783,32 @@ class TestPromptCache(unittest.TestCase):
 
         self.assertLess(float(err35), float(err3))
 
+    def test_turboquant_fractional_half_split_uses_prefix_channels(self):
+        """Half split mode should assign the leading channels to the high-bit branch."""
+        c = TurboQuantKVCache(bits=3.5, fractional_split_mode="half")
+        k = mx.random.normal(shape=(1, 2, 8, 8))
+        v = mx.random.normal(shape=(1, 2, 8, 8))
+        c.update_and_fetch(k, v)
+
+        self.assertEqual(c.fractional_split_mode, "half")
+        self.assertTrue(mx.array_equal(c._split_high_idx, mx.array([0, 1, 2, 3], dtype=mx.int32)))
+        self.assertTrue(mx.array_equal(c._split_low_idx, mx.array([4, 5, 6, 7], dtype=mx.int32)))
+
+    def test_turboquant_qjl_scale_changes_correction_magnitude(self):
+        """Custom QJL scale should rescale the reconstruction correction directly."""
+        projection = mx.eye(4, dtype=mx.float32)
+        signs = mx.array([[[[1, 0, 1, 0]]]], dtype=mx.uint8)
+        gamma = mx.ones((1, 1, 1, 1), dtype=mx.float32)
+
+        corrected_default = _dequantize_qjl(signs, gamma, projection)
+        corrected_half = _dequantize_qjl(signs, gamma, projection, qjl_scale_coeff=0.5)
+        mx.eval(corrected_default, corrected_half)
+
+        self.assertLess(
+            float(mx.linalg.norm(corrected_half).item()),
+            float(mx.linalg.norm(corrected_default).item()),
+        )
+
     def test_turboquant_cache_trim(self):
         """Test TurboQuantKVCache trim."""
         c = TurboQuantKVCache(bits=3)
@@ -1023,6 +1050,21 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(prompt_cache[2].turbo_bits, 3.5)
         self.assertIsInstance(prompt_cache[3], ArraysCache)
         self.assertIsInstance(prompt_cache[4], KVCache)
+
+    def test_make_prompt_cache_turboquant_forwards_qjl_scale_and_fractional_split_mode(self):
+        """Prompt cache routing should forward QJL scale and fractional split policy."""
+        model = DummyCacheModel([KVCache() for _ in range(4)])
+
+        prompt_cache = make_prompt_cache(
+            model,
+            turbo_kv_bits=3.5,
+            turbo_fp16_layers=1,
+            turbo_qjl_scale=0.5,
+            turbo_fractional_split_mode="half",
+        )
+
+        self.assertEqual(prompt_cache[1].qjl_scale, 0.5)
+        self.assertEqual(prompt_cache[1].fractional_split_mode, "half")
 
     def test_make_prompt_cache_turboquant_forwards_decode_buffer(self):
         """Test TurboQuant cache routing forwards decode-buffer mode."""
@@ -1352,9 +1394,52 @@ class TestPromptCache(unittest.TestCase):
 
         self.assertEqual(dk.shape, k.shape)
         self.assertEqual(dv.shape, v.shape)
+        self.assertEqual(cache._deq_alloc, 256)
         self.assertEqual(dk2.shape[-2], 9)
         self.assertEqual(dv2.shape[-2], 9)
         self.assertEqual(cache._deq_offset, 9)
+
+    def test_turboquant_decode_buffer_adopts_raw_prefill_without_initial_copy(self):
+        mx.random.seed(0)
+        k = mx.random.normal(shape=(1, 4, 8, 64))
+        v = mx.random.normal(shape=(1, 4, 8, 64))
+
+        cache = TurboQuantKVCache(
+            bits=3,
+            estimator_mode="prod",
+            qjl_projection_mode="wht",
+            decode_buffer=True,
+        )
+
+        dk, dv = cache.update_and_fetch(k, v)
+        mx.eval(dk, dv)
+
+        self.assertEqual(cache._deq_offset, 8)
+        self.assertEqual(cache._deq_alloc, 8)
+        self.assertEqual(cache._k_deq_buf.shape, k.shape)
+        self.assertEqual(cache._v_deq_buf.shape, v.shape)
+
+    def test_turboquant_materialize_decode_buffer_adopts_initial_materialization(self):
+        mx.random.seed(0)
+        k = mx.random.normal(shape=(1, 4, 8, 64))
+        v = mx.random.normal(shape=(1, 4, 8, 64))
+
+        cache = TurboQuantKVCache(
+            bits=3,
+            estimator_mode="prod",
+            qjl_projection_mode="wht",
+            decode_buffer=True,
+        )
+        cache.update_and_fetch(k, v)
+        cache._invalidate_decode_buffer()
+
+        dk, dv = cache._materialize_decode_buffer(k.dtype, v.dtype)
+        mx.eval(dk, dv)
+
+        self.assertEqual(cache._deq_offset, 8)
+        self.assertEqual(cache._deq_alloc, 8)
+        self.assertEqual(cache._k_deq_buf.shape, k.shape)
+        self.assertEqual(cache._v_deq_buf.shape, v.shape)
 
     def test_turboquant_recent_buffer_attention_matches_reference(self):
         """Test mixed compressed+recent-buffer attention matches materialized KV."""
@@ -1540,6 +1625,7 @@ class TestPromptCache(unittest.TestCase):
                 estimator_mode="prod",
                 qjl_residual=False,
                 max_cache_tokens=12,
+                qjl_scale=0.5,
             )
         ]
         x = mx.random.normal(shape=(1, 8, 10, 64))
@@ -1552,6 +1638,19 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(loaded.value_bits_override, 3)
         self.assertFalse(loaded.qjl_residual)
         self.assertEqual(loaded.max_cache_tokens, 12)
+        self.assertEqual(loaded.qjl_scale, 0.5)
+
+    def test_turboquant_fractional_split_mode_save_load(self):
+        """Fractional split mode should survive save/load roundtrip."""
+        cache_file = os.path.join(self.test_dir, "turbo_cache_frac_split_mode.safetensors")
+
+        cache = [TurboQuantKVCache(bits=3.5, fractional_split_mode="half")]
+        x = mx.random.normal(shape=(1, 8, 10, 64))
+        cache[0].update_and_fetch(x, x)
+
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self.assertEqual(loaded_cache[0].fractional_split_mode, "half")
 
     def test_rotorquant_save_load(self):
         """Test RotorQuant cache save/load roundtrip."""
